@@ -1,0 +1,18 @@
+# IDE编译临时文件
+**/Debug/
+**/Release/
+*.o
+*.elf
+*.hex
+*.tmp
+*.log
+
+# MATLAB/Simulink 缓存
+Matlab/slprj/
+Simulink/slprj/
+*.asv
+
+# 大文件（视频等）
+Test/*.mp4
+Test/*.avi
+*.zip
