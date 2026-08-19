@@ -1,0 +1,59 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cppbuild",
+			"label": "C/C++: gcc.exe 生成活动文件",
+			"command": "C:\\msys64\\ucrt64\\bin\\gcc.exe",
+			"args": [
+				"-fdiagnostics-color=always",
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}\\${fileBasenameNoExtension}.exe"
+			],
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build",
+			"detail": "编译器: C:\\msys64\\ucrt64\\bin\\gcc.exe"
+		},
+		{
+			"type": "shell",
+			"label": "C: 编译并运行(当前文件)",
+			"command": ".\\${fileBasenameNoExtension}.exe",
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+			"dependsOn": [
+				"C/C++: gcc.exe 生成活动文件"
+			],
+			"dependsOrder": "sequence",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		},
+		{
+			"type": "shell",
+			"label": "C: 编译运行并保存日志(按文件名)",
+			"command": ".\\${fileBasenameNoExtension}.exe | Tee-Object -FilePath \"${workspaceFolder}\\output\\${fileBasenameNoExtension}.log\"",
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+			"dependsOn": [
+				"C/C++: gcc.exe 生成活动文件"
+			],
+			"dependsOrder": "sequence",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared",
+				"clear": true
+			}
+		}
+	]
+}
