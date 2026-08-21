@@ -6,7 +6,7 @@
  * ========================= */
 
 /* ADC原始采样值：0~4095 */
-uint16_t adc_current_raw = 2048;
+uint16_t adc_current_raw = 2148;  //这类写在所有函数外面的叫全局变量，简单理解就是很多函数都可以访问的变量，和局部变量相对，局部变量只能在函数内部使用。
 
 /* 母线电压ADC原始值 */
 uint16_t adc_vbus_raw = 3000;
@@ -21,7 +21,7 @@ uint32_t control_loop_count = 0;
 uint8_t motor_enable = 0;
 
 /* 电机转速，单位 rpm */
-int16_t motor_speed_rpm = 0;
+int16_t motor_speed_rpm = 0; //因为电机转速可能是正的也可能是负的，所以用有符号整数类型 int16_t 来表示。
 
 /* 实际物理量 */
 float phase_current = 0.0f;
@@ -31,9 +31,9 @@ float dc_bus_voltage = 0.0f;
 /* =========================
  * ADC原始值转换为电流
  * ========================= */
-float ADC_To_Current(uint16_t adc_raw)
+float ADC_To_Current(uint16_t adc_raw)   //其中adc_raw,current_scale,adc_offset都是局部变量，只有在这个函数内部可以使用，出了这个函数就不能用了。
 {
-    float adc_offset = 2048.0f;
+    float adc_offset = 2048.0f;    
     float current_scale = 0.01f;
 
     float current;
@@ -53,7 +53,7 @@ float ADC_To_Vbus(uint16_t adc_raw)
 
     float voltage;
 
-    voltage = (float)adc_raw * voltage_scale;
+    voltage = (float)adc_raw * voltage_scale;   //(float)adc_raw 这是类型转换，等于是说接下来参与这个计算的时候，把它按照 `float` 来处理。
 
     return voltage;
 }
@@ -72,7 +72,7 @@ void Motor_Control_Loop(void)
 
     if (motor_enable == 1)
     {
-        motor_speed_rpm = 1000;
+        motor_speed_rpm = -1000;
     }
     else
     {
