@@ -18,14 +18,14 @@
 
 
 /* =========================
- * 常量
+ * 常量 ：一般这个变量定义之后，不希望再被修改。是一种对代码的保护和约束
  * ========================= */
 
 const float control_ts = 1.0f / CONTROL_FREQ_HZ;
 
 
 /* =========================
- * 模拟硬件/中断共享变量
+ * 模拟硬件/中断共享变量  //volatile的作用是告诉编译器，这个变量可能会被其他线程或中断程序修改，所以每次访问这个变量时都要从内存中重新读取，而不是使用寄存器中的缓存值。这样可以确保程序在多线程或中断环境下能够正确地读取和写入这个变量的值。
  * ========================= */
 
 volatile uint16_t adc_current_raw = 2048U;
@@ -84,8 +84,9 @@ float ADC_To_Current(uint16_t adc_raw)
 
 void Motor_Control_ISR(void)
 {
-    static float last_current = 0.0f;
-
+    static float last_current = 0.0f;  //static的作用是,使你定义的这个变量只要定义一次,就会一直存在,不会随着函数的调用而消失,
+                                      //也不会随着函数的调用而重新定义（比如后面再调用这个函数，这个变量的值不是0.0f，而是上一次运行后的值）,它的值会一直保留着,直到程序结束. 也就是说,static变量的生命周期是整个程序运行期间.
+                                      //static很方便用来保留历史状态
     control_isr_count++;
 
 
@@ -128,6 +129,15 @@ void Current_Limit(void)
     }
 }
 
+void Static_Test(void)
+{
+     uint32_t count = 0U;  // 看看加与不加static的区别
+
+    count++;
+
+    printf("Static Count = %lu\n",
+           (unsigned long)count);
+}
 
 /* =========================
  * 主程序
@@ -135,6 +145,9 @@ void Current_Limit(void)
 
 int main(void)
 {
+    Static_Test();
+    Static_Test();
+    Static_Test();
     printf("PWM Frequency     = %u Hz\n",
            PWM_FREQ_HZ);
 

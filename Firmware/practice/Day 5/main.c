@@ -1,7 +1,8 @@
 #include <stdio.h>
-
 #include "pi.h"
 
+//gcc main.c pi.c -o output/main.exe
+//.\output\main.exe
 
 int main(void)
 {
@@ -58,13 +59,16 @@ int main(void)
     printf("Id Ref = %.2f A\n", id_ref);
     printf("Id     = %.2f A\n", id);
     printf("Vd     = %.2f V\n", vd);
-
     printf("\n");
 
     printf("Iq Ref = %.2f A\n", iq_ref);
     printf("Iq     = %.2f A\n", iq);
     printf("Vq     = %.2f V\n", vq);
 
+    printf("PI Q Output = %.2f\n",
+       PI_GetOutput(&pi_q));
+
 
     return 0;
+    
 }
