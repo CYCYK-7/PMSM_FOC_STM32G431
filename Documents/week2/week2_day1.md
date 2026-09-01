@@ -1,580 +1,1085 @@
-对。**从第二周开始，代码的放置方式要和第一周不一样。**
+# STM32G431 学习笔记 01
 
-第一周那些 C 语言代码本质上是练习，可以按 `Day01/Day02/...` 分文件夹；但第二周开始已经进入真正的 STM32G431 固件开发，**不建议每天复制一个完整 STM32 工程**。更合适的是从 Day 1 建立一个真正的固件工程，然后 Day 2 GPIO、Day 3 UART、Day 4 Timer……都在这个工程上继续演进，每完成一个稳定功能就 Commit。
-
-这也最符合你半年计划中“一路从 GPIO/UART → Timer → PWM → ADC → FOC 形成真实开发历史”的思路。
-
-# 一、从第二周开始，代码放在哪里
-
-你最开始建立的仓库是：
-
-```text
-PMSM_FOC_STM32G431/
-│
-├── Firmware/
-├── Matlab/
-├── Simulink/
-├── Documents/
-├── Debug_Log/
-├── Test/
-└── README.md
-```
-
-这正是原计划规定的项目骨架。
-
-我建议现在整理成这样：
-
-```text
-PMSM_FOC_STM32G431/
-│
-├── Firmware/
-│   │
-│   ├── practice/
-│   │   └── Week01_C/
-│   │       ├── Day01_BasicTypes/
-│   │       ├── Day02_ArrayPointer/
-│   │       ├── Day03_StructTypedef/
-│   │       ├── Day04_EmbeddedKeywords/
-│   │       ├── Day05_Module/
-│   │       ├── Day06_CurrentLoop/
-│   │       └── Day07_Review/
-│   │
-│   └── PMSM_FOC_G431/
-│       └── ← 从 Week 2 Day 1 开始，真正STM32工程放这里
-│
-├── Matlab/
-├── Simulink/
-│
-├── Documents/
-│   └── Week02/
-│
-├── Debug_Log/
-│   └── Week02_Debug.md
-│
-├── Test/
-│
-└── README.md
-```
-
-其中最重要的是：
-
-```text
-Firmware/PMSM_FOC_G431/
-```
-
-**从今天开始，这个就是你的主固件工程。**
+## 从新建工程到 GPIO 实机运行 + USART3 初步配置
 
 ------
 
-# 二、以后不要建立 Day02_GPIO、Day03_UART 的完整工程副本
+## 一、今天实际完成了什么
 
-比如我们今天建立：
-
-```text
-Firmware/
-└── PMSM_FOC_G431/
-```
-
-Day 2 做 GPIO 后，还是这个：
+今天完整走通了第一条真正的 STM32 开发链：
 
 ```text
-Firmware/
-└── PMSM_FOC_G431/
-```
-
-只是代码增加 GPIO。
-
-Day 3 做 UART：
-
-```text
-Firmware/
-└── PMSM_FOC_G431/
-```
-
-继续增加 UART。
-
-Day 4 Timer：
-
-```text
-Firmware/
-└── PMSM_FOC_G431/
-```
-
-继续增加 Timer。
-
-一直到以后：
-
-```text
-GPIO
- ↓
-UART
- ↓
-Timer
- ↓
-PWM
- ↓
-ADC
- ↓
-Clarke/Park
- ↓
-PI
- ↓
-SVPWM
- ↓
-Encoder
- ↓
-FOC
-```
-
-都让同一个工程逐渐长起来。
-
-这样 Git 才真正有意义。
-
-------
-
-# 三、Git 就负责保存“每天的版本”
-
-不用：
-
-```text
-Day02_GPIO工程
-Day03_UART工程
-Day04_Timer工程
-```
-
-来保存历史。
-
-而是：
-
-```text
-PMSM_FOC_G431
-    │
-    ├── Commit：Initial STM32G431 firmware project
-    │
-    ├── Commit：Add GPIO LED test
-    │
-    ├── Commit：Add UART communication
-    │
-    ├── Commit：Add timer interrupt
-    │
-    ├── Commit：Implement TIM1 PWM
-    │
-    └── ...
-```
-
-这才是你的半年计划真正想训练的工程开发方式。
-
-你的计划本来也明确要求 Week 2 开始形成：
-
-> **一个功能对应一个清晰 Commit。**
-
-------
-
-# 四、Documents 和 Debug_Log 怎么用
-
-以后配置过程中有一些**值得保留但不是代码**的东西，不要塞进固件源码。
-
-例如今天可以建立：
-
-```text
-Documents/
-└── Week02/
-    └── Day01_STM32_Project_Setup.md
-```
-
-以后简单记录：
-
-```markdown
-# Week 2 Day 1
-
-## MCU
-STM32G431xxx
-
-## IDE
-STM32CubeIDE
-
-## Debugger
-ST-LINK
-
-## 工程位置
-Firmware/PMSM_FOC_G431/
-
-## 今天完成
-- 创建STM32工程
-- Build成功
-- ST-LINK连接成功
-- Download成功
-- Debug成功
-```
-
-如果今天遇到问题，比如：
-
-```text
-ST-LINK找不到芯片
-编译失败
-下载失败
-时钟配置错误
-```
-
-记录在：
-
-```text
-Debug_Log/
-└── Week02_Debug.md
-```
-
-以后这些反而很适合面试讲。
-
-------
-
-# 五、所以第二周最终目录会逐渐变成
-
-Week 2 结束大概：
-
-```text
-PMSM_FOC_STM32G431/
-│
-├── Firmware/
-│   ├── practice/
-│   │   └── Week01_C/
-│   │
-│   └── PMSM_FOC_G431/
-│       ├── Core/
-│       │   ├── Inc/
-│       │   └── Src/
-│       ├── Drivers/
-│       ├── Debug/
-│       ├── ...
-│       └── PMSM_FOC_G431.ioc
-│
-├── Documents/
-│   └── Week02/
-│
-├── Debug_Log/
-│   └── Week02_Debug.md
-│
-└── ...
-```
-
-其中 `Core/Drivers/...` 这些目录**不用你自己手动创建**，STM32CubeIDE/CubeMX 创建工程后会帮你生成。
-
-------
-
-# Week 2 · Day 1
-
-今天正式开始：
-
-> **建立 STM32G431 主工程 + 搞明白 STM32 开发流程 + Build / Download / Debug 第一次跑通**
-
-你的 Week 2 原计划要求建立这样一条完整流程：
-
-```text
-CubeMX / CubeIDE
-        ↓
-配置工程
-        ↓
-生成代码
-        ↓
+选择 MCU
+   ↓
+创建 STM32CubeIDE 工程
+   ↓
+.ioc 配置
+   ↓
+系统时钟配置
+   ↓
+GPIO 配置
+   ↓
+CubeMX 自动生成代码
+   ↓
 Build
-        ↓
+   ↓
 ST-LINK
-        ↓
+   ↓
 Download
-        ↓
-Debug
+   ↓
+MCU 运行
+   ↓
+LED 实机验证成功
 ```
 
+这条流程非常重要。
 
+以后无论你做的是：
 
-今天就只完成这条链。
+```text
+LED
+UART
+PWM
+ADC
+Encoder
+FOC
+电流环
+速度环
+Sensorless
+```
 
-**暂时不做 GPIO，不做 UART，不做 Timer。**
+底层开发流程其实都不会脱离：
+
+```text
+配置 → 生成代码 → 写业务代码 → Build → Download → Debug
+```
+
+这也是原半年计划要求你真正建立的 STM32 开发闭环。
+
+你今天还额外开始配置了：
+
+```text
+USART3
+115200
+8N1
+Asynchronous
+```
+
+但 USART3 **还没有完成电脑端串口实机验证**，所以这个功能目前属于“已配置、待验证”。
 
 ------
 
-# 六、Day 1 最终目标
+# 二、以后重新建立 STM32G431 工程怎么做
 
-今天结束的时候，达到：
+## 1. 创建工程
+
+STM32CubeIDE：
+
+```text
+File
+→ New
+→ STM32 Project
+```
+
+进入 `Target Selection`。
+
+选择：
+
+```text
+MCU/MPU Selector
+```
+
+而不是 Board Selector。
+
+原因是你的电机控制板不是 ST 官方 NUCLEO 开发板，而是以具体 MCU 为核心设计的板子。
+
+搜索：
+
+```text
+STM32G431CBU6
+```
+
+你这块板使用的 MCU 就是：
+
+```text
+STM32G431CBU6
+```
+
+这里有一个非常重要的工程习惯：
+
+> **芯片型号不要靠“差不多”选择，一定查原理图、芯片丝印或开发板资料。**
+
+例如：
+
+```text
+STM32G431CBU6
+STM32G431CBT6
+STM32G431RBT6
+```
+
+看起来很像，但封装、Flash、引脚数量等可能不同。
+
+以后工作中选错 MCU 型号，很可能直接导致：
+
+```text
+CubeMX 引脚不一致
+外设找不到
+烧录异常
+链接脚本错误
+Flash/RAM 配置错误
+```
+
+------
+
+# 三、工程创建页面怎么选
+
+今天使用的是：
+
+| 选项                  | 设置            |
+| --------------------- | --------------- |
+| Project Name          | `PMSM_FOC_G431` |
+| Targeted Language     | `C`             |
+| Targeted Binary Type  | `Executable`    |
+| Targeted Project Type | `STM32Cube`     |
+
+### 为什么选 C？
+
+嵌入式电机控制里 C 仍然非常重要。
+
+以后你看到的：
+
+```c
+HAL_ADC_Start()
+HAL_TIM_PWM_Start()
+HAL_UART_Transmit()
+FOC_Run()
+PI_Run()
+SVPWM_Run()
+```
+
+绝大多数都是 C 接口。
+
+你的目标不是成为纯软件开发程序员，而是：
+
+> 能读、能改、能组织、能 Debug 电机控制 C 程序。
+
+所以 C 足够，而且非常符合岗位需求。
+
+### Executable 是什么？
+
+表示最终生成：
+
+> 可以烧录到 STM32 Flash 中执行的程序。
+
+`Static Library` 是生成静态库，现在不用。
+
+### 为什么选择 STM32Cube？
+
+因为这样 CubeMX 才能帮助你配置：
+
+```text
+Clock
+GPIO
+TIM
+ADC
+UART
+DMA
+NVIC
+...
+```
+
+并自动产生 HAL 初始化代码。
+
+------
+
+# 四、Firmware Package 页面怎么选
+
+今天选择：
+
+```text
+STM32Cube FW_G4
+```
+
+因为 STM32G431 属于：
+
+```text
+STM32G4 Series
+```
+
+Code Generator 选择：
+
+```text
+Copy only the necessary library files
+```
+
+意思是：
+
+> 把当前工程真正需要的 HAL/CMSIS 文件复制进工程。
+
+对于你现阶段非常合适。
+
+------
+
+# 五、`.ioc` 到底是什么
+
+这是今天必须开始真正理解的东西。
+
+例如：
+
+```text
+PMSM_FOC_G431.ioc
+```
+
+它不是你的主要 C 程序，而是：
+
+> **CubeMX 的硬件配置文件。**
+
+你在 `.ioc` 里面做：
+
+```text
+PC4 → GPIO Output
+USART3 → Asynchronous
+TIM1 → PWM
+ADC1 → Analog Input
+Clock → 170 MHz
+```
+
+CubeMX 再根据这些配置自动生成：
+
+```c
+MX_GPIO_Init();
+MX_USART3_UART_Init();
+MX_TIM1_Init();
+MX_ADC1_Init();
+```
+
+所以可以这样理解：
+
+```text
+.ioc
+=
+硬件配置说明书
+```
+
+而：
+
+```text
+main.c
+*.c/*.h
+=
+真正运行的软件
+```
+
+------
+
+# 六、今天非常重要的知识：Pin Multiplexing
+
+STM32 一个引脚通常不只是一个功能。
+
+例如某个引脚可能能够作为：
+
+```text
+普通 GPIO
+UART_TX
+TIM_CHx
+ADC
+SPI
+I2C
+...
+```
+
+这叫：
+
+> **Pin Multiplexing，引脚复用。**
+
+所以 CubeMX 里点击一个 Pin 时，会看到多个功能。
+
+这也是你今天 LED 出问题的根本原因：
+
+> **实际硬件 LED 接在哪个 GPIO，必须根据原理图确定，而不能自己随便选一个 GPIO。**
+
+这是非常典型的嵌入式 Debug 思维。
+
+以后电机不转，你第一反应不能只是：
+
+> “是不是代码算法错了？”
+
+而要逐层确认：
+
+```text
+原理图
+↓
+Pin
+↓
+CubeMX 配置
+↓
+初始化代码
+↓
+HAL调用
+↓
+真实引脚电平
+↓
+外围硬件
+```
+
+你今天因为“GPIO 引脚选错导致 LED 不工作”，其实就是一次非常标准的硬件软件联合 Debug。
+
+------
+
+# 七、SYS → Serial Wire 是干什么的
+
+在：
+
+```text
+System Core
+→ SYS
+```
+
+配置：
+
+```text
+Debug = Serial Wire
+```
+
+之后：
+
+```text
+PA13 → SWDIO
+PA14 → SWCLK
+```
+
+会用于：
 
 ```text
 PC
  ↓
-STM32CubeIDE
+ST-LINK
  ↓
-建立 STM32G431 工程
+SWD
  ↓
-生成代码
- ↓
-Build 0 Errors
- ↓
-ST-LINK连接
- ↓
-Download 到 MCU
- ↓
-进入 Debug
- ↓
-在 main() 设置断点
- ↓
-MCU成功停在断点
+STM32
 ```
 
-做到这里，Day 1 就结束。
+SWD 全称：
 
-不要继续往 GPIO 冲。
+> **Serial Wire Debug**
 
-------
+这是 ARM Cortex-M MCU 非常常见的调试接口。
 
-# 七、今天先理解 5 个东西
-
-今天不要学一大堆 STM32 理论。
-
-只搞懂：
-
-### ① STM32CubeIDE
-
-可以先理解成：
-
-> STM32 官方开发环境。
-
-它帮你完成：
+通常最核心的信号就是：
 
 ```text
-编辑代码
-+
-编译
-+
-下载
-+
-Debug
+SWDIO
+SWCLK
+GND
+```
+
+再根据情况加入：
+
+```text
+NRST
+VTref
 ```
 
 ------
 
-### ② CubeMX
+# 八、ST-LINK 是什么
 
-负责：
+这个以后工作必须能说清楚。
+
+不要只理解成：
+
+> “那个拿来烧程序的小东西。”
+
+更专业的理解是：
+
+> **ST-LINK 是 ST 针对 STM32 提供的下载与在线调试工具，通过 SWD/JTAG 与 MCU 通信。**
+
+它至少负责两件重要事情：
 
 ```text
-选择MCU
- ↓
-配置Pin
- ↓
-配置Clock
- ↓
-配置GPIO/UART/Timer/ADC
- ↓
-自动生成初始化代码
+Programming
++
+Debugging
 ```
 
-现在 CubeMX 功能已经集成在 CubeIDE 里，所以后面我们很多时候直接在 `.ioc` 配置界面操作即可。
+也就是：
+
+### 烧录
+
+把编译得到的 MCU 程序：
+
+```text
+PC
+↓
+ST-LINK
+↓
+STM32 Flash
+```
+
+### 在线调试
+
+允许 IDE：
+
+```text
+暂停 MCU
+打断点
+单步运行
+观察变量
+查看内存
+继续运行
+```
+
+以后真正做电机控制时，这个非常重要。
 
 ------
 
-### ③ Build
+# 九、Build 和 Download 必须严格区分
 
-比如你有：
+这是面试也可能问到的基础概念。
 
-```c
-main.c
-```
-
-以及大量：
+## Build
 
 ```text
-HAL
-CMSIS
-启动文件
-```
-
-Build 会经过大概：
-
-```text
-C源码
+.c / .h
  ↓
 Compiler
  ↓
-目标文件
+.o
  ↓
 Linker
  ↓
 最终程序
 ```
 
-今天不用研究编译器细节。
+可以简单理解成：
 
-只记：
+> **把你的 C 代码转换成 MCU 能运行的机器程序。**
 
-> **Build = 把人写的代码变成 MCU 能运行的程序。**
-
-------
-
-### ④ ST-LINK
-
-你以后非常经常看到：
+所以：
 
 ```text
-PC
-  │
- USB
-  ↓
+Build Success
+```
+
+只能说明：
+
+> 软件能够成功编译和链接。
+
+它绝对不意味着：
+
+```text
+GPIO正确
+硬件正确
+LED正确
+电机能转
+FOC正确
+```
+
+你今天亲自验证了这一点：
+
+> Build 完全没有报错，但 GPIO 引脚配错以后 LED 仍然没有动作。
+
+所以一定记住：
+
+Build成功≠功能正确\boxed{\text{Build成功}\neq\text{功能正确}}
+
+这是一条很有价值的工程意识。你原来的学习计划也专门强调了这一点。
+
+## Download
+
+则是：
+
+```text
+已经 Build 好的程序
+↓
 ST-LINK
-  │
- SWD
-  ↓
-STM32G431
-```
-
-它主要负责：
-
-```text
-烧录
-+
-在线Debug
+↓
+烧入 STM32 Flash
 ```
 
 ------
 
-### ⑤ Debug
+# 十、Run 和 Debug 有什么区别
 
-Debug 不是普通“运行”。
+### Run
 
-它允许你：
+目标主要是：
+
+> 让 MCU 正常执行程序。
+
+### Debug
+
+则允许你控制 MCU：
 
 ```text
-暂停程序
-看变量
+Breakpoint
+Step Over
+Step Into
+Resume
+Watch
+Expressions
+Call Stack
+```
+
+以后电机控制岗位很看重 Debug 能力。
+
+例如：
+
+```text
+电机突然停转
+```
+
+一个真正有工程能力的人不会只盯着代码猜。
+
+可能会：
+
+```text
 打断点
-单步执行
-继续运行
+↓
+检查状态机
+↓
+看 fault_flag
+↓
+看 ADC current
+↓
+看 speed
+↓
+看 PWM duty
+↓
+找到异常产生的位置
 ```
 
-以后电机不转的时候，这东西非常重要。
+所以 Debugger 不是附加功能，而是你的工作工具。
 
 ------
 
-# 八、今天创建 STM32 工程
+# 十一、STM32 时钟系统——今天最值得认真理解的专业知识之一
 
-建议工程名称直接：
-
-```text
-PMSM_FOC_G431
-```
-
-这样就和我们之前确定的：
+今天把 STM32G431 配到了：
 
 ```text
-Firmware/PMSM_FOC_G431/
+170 MHz
 ```
 
-一致。
-
-不要取：
+使用：
 
 ```text
-test
-test1
-123
-demo
-aaa
+HSI = 16 MHz
 ```
 
-以后这个工程会一路变成你的求职项目。
+然后：
+
+```text
+HSI
+ ↓
+PLLM /4
+ ↓
+4 MHz
+ ↓
+PLLN ×85
+ ↓
+340 MHz
+ ↓
+PLLR /2
+ ↓
+170 MHz
+```
+
+即：
+
+fSYSCLK=16 MHz4×85÷2=170 MHzf_{\text{SYSCLK}} = \frac{16\,MHz}{4}\times85\div2 = 170\,MHz
 
 ------
 
-# 九、工程放置位置
+# 十二、HSI / HSE 是什么
 
-路径选择你仓库里的：
+## HSI
 
-```text
-PMSM_FOC_STM32G431/
-└── Firmware/
-```
+High Speed Internal。
 
-最终应该让 CubeIDE 工程位于：
+就是：
 
-```text
-PMSM_FOC_STM32G431/
-└── Firmware/
-    └── PMSM_FOC_G431/
-```
+> MCU 内部自带的高速 RC 时钟源。
 
-不要让 CubeIDE 默认把它创建到：
+优点：
 
 ```text
-C:\Users\xxx\STM32CubeIDE\workspace...
+不需要外部晶振
+启动方便
+配置简单
 ```
 
-然后和 Git 仓库完全分离。
+缺点是：
 
-这一点今天非常重要。
+> 精度通常不如高质量外部晶振。
+
+## HSE
+
+High Speed External。
+
+就是：
+
+> 外部高速时钟/晶振。
+
+来自 MCU 外面的硬件。
+
+以后做不同产品时，具体选择要根据：
+
+```text
+精度
+成本
+通信要求
+硬件设计
+EMC
+```
+
+综合决定。
 
 ------
 
-# 十、第一步：确认你到底是哪一颗 G431
+# 十三、PLL 是什么
 
-你的开发板虽然确定是：
+PLL：
+
+> **Phase Locked Loop，锁相环。**
+
+你现在阶段可以先把它理解成：
+
+> 把较低的输入时钟经过分频、倍频，再得到我们需要的高频系统时钟。
+
+你的例子：
 
 ```text
-STM32G431
+16 MHz
+↓
+PLL
+↓
+170 MHz
 ```
 
-但芯片完整型号一般还会类似：
+以后看到：
 
 ```text
-STM32G431CBT6
-STM32G431RBT6
-...
+PLLM
+PLLN
+PLLR
+PLLQ
+PLLP
 ```
 
-这里**不要凭记忆乱选**。
+不要怕。
 
-你可以看：
-
-- 芯片表面的完整丝印；
-- 开发板资料；
-- 原理图；
-- 之前买板子的资料。
-
-最终在 CubeIDE 创建工程时选择完全对应的 MCU。
-
-如果你的开发板有对应官方/厂商 `.ioc` 工程，后面也可能直接基于它，但今天先理解这个原则。
-
-------
-
-# 十一、创建工程以后你会看到很多文件
-
-初学者第一次打开非常容易懵：
+核心思想就是：
 
 ```text
-Core
-Drivers
-Middlewares
-Debug
-...
-```
-
-今天不要全点。
-
-你只关注：
-
-```text
-Core/
-├── Inc/
-└── Src/
-```
-
-尤其：
-
-```text
-Core/Src/main.c
+输入
+↓
+分频
+↓
+倍频
+↓
+再次分频
+↓
+输出不同用途的时钟
 ```
 
 ------
 
-# 十二、main.c 就是今天最重要的入口
+# 十四、SYSCLK、HCLK、PCLK 是什么
 
-打开以后你大概率会看到：
+这是工作中非常值得掌握的。
+
+可以先建立这样的框架：
+
+```text
+Clock Source
+     ↓
+    PLL
+     ↓
+  SYSCLK
+     ↓
+AHB Prescaler
+     ↓
+   HCLK
+     ↓
+ ┌───────────┐
+ ↓           ↓
+APB1        APB2
+ ↓           ↓
+PCLK1       PCLK2
+```
+
+### SYSCLK
+
+System Clock。
+
+可以理解成：
+
+> 整个 MCU 系统最核心的系统时钟来源。
+
+### HCLK
+
+主要进入：
+
+```text
+CPU Core
+AHB Bus
+Memory
+DMA
+部分外设
+```
+
+### PCLK
+
+Peripheral Clock。
+
+主要给挂在 APB 总线上的外设。
+
+例如：
+
+```text
+UART
+Timer
+SPI
+I2C
+```
+
+会根据芯片结构挂在 APB1 或 APB2。
+
+------
+
+# 十五、为什么电机控制工程师必须懂时钟
+
+因为以后所有实时控制最终都要落到：
+
+> **时间。**
+
+比如你以后可能设置：
+
+```text
+PWM = 20 kHz
+```
+
+意味着：
+
+TPWM=120000=50μsT_{PWM}=\frac1{20000}=50\mu s
+
+如果 FOC 每个 PWM 周期执行一次，那么你只有大约：
+
+```text
+50 μs
+```
+
+完成：
+
+```text
+ADC采样
+↓
+Clarke
+↓
+Park
+↓
+PI
+↓
+InvPark
+↓
+SVPWM
+↓
+更新PWM
+```
+
+所以：
+
+```text
+Clock
+→ Timer
+→ PWM
+→ ADC Trigger
+→ Control ISR
+→ FOC
+```
+
+其实是一条完整的实时控制链。
+
+这也是为什么我们以后学 PWM 之前一定要先把 Clock 搞懂。
+
+------
+
+# 十六、GPIO 是什么
+
+GPIO：
+
+> **General Purpose Input/Output**
+
+通用输入输出。
+
+简单来说：
+
+```text
+Input
+→ MCU读取外部高低电平
+
+Output
+→ MCU向外输出高低电平
+```
+
+例如：
+
+```text
+LED
+继电器
+Enable
+Fault
+按键
+```
+
+很多都会使用 GPIO。
+
+------
+
+# 十七、GPIO Output Push-Pull 是什么
+
+你今天 LED 使用的是：
+
+```text
+Output Push Pull
+```
+
+这是非常常见的输出方式。
+
+Push-Pull 可以主动输出：
+
+```text
+HIGH
+或者
+LOW
+```
+
+可以简单理解成 MCU 内部有：
+
+```text
+上拉输出管
++
+下拉输出管
+```
+
+所以：
+
+```text
+输出 HIGH
+→ 主动拉高
+
+输出 LOW
+→ 主动拉低
+```
+
+特别适合：
+
+```text
+LED
+普通数字控制
+Chip Enable
+```
+
+------
+
+# 十八、Push-Pull 和 Open-Drain 要能区分
+
+以后面试很可能碰到。
+
+### Push-Pull
+
+可以主动输出：
+
+```text
+High
+Low
+```
+
+### Open-Drain
+
+通常：
+
+```text
+可以主动拉低
+但不能主动拉高
+```
+
+需要：
+
+```text
+Pull-up resistor
+```
+
+才能获得高电平。
+
+典型应用：
+
+```text
+I2C
+```
+
+所以如果以后面试问：
+
+> “为什么 I2C 通常使用开漏输出？”
+
+至少应该知道：
+
+> 因为多个设备可以共享总线，设备通过拉低总线表示低电平，而高电平由公共上拉电阻产生，可以避免多个设备主动输出相反电平造成冲突。
+
+这个以后我们学 I2C 时再深入。
+
+------
+
+# 十九、Pull-Up / Pull-Down 是什么
+
+GPIO Input 如果什么都没有连接，输入可能处于：
+
+> Floating，悬空。
+
+也就是说：
+
+```text
+不是稳定 0
+也不是稳定 1
+```
+
+可能受到干扰。
+
+于是可以：
+
+```text
+Pull-Up
+→ 默认拉成 High
+
+Pull-Down
+→ 默认拉成 Low
+```
+
+你今天 LED 输出：
+
+```text
+No Pull
+```
+
+通常没有问题，因为 Push-Pull 自己就在主动输出电平。
+
+------
+
+# 二十、为什么 LED 有时候 LOW 才亮
+
+这个非常常见。
+
+如果硬件：
+
+```text
+3.3V
+ │
+电阻
+ │
+LED
+ │
+GPIO
+```
+
+那么：
+
+```text
+GPIO = LOW
+```
+
+电流：
+
+```text
+3.3V
+↓
+电阻
+↓
+LED
+↓
+GPIO
+↓
+GND
+```
+
+于是 LED 亮。
+
+这种称为：
+
+> **Active Low，低电平有效。**
+
+以后你经常看到：
+
+```text
+LED_ON = 0
+ENABLE_N
+RESET_N
+FAULT_N
+CS_N
+```
+
+名字最后带：
+
+```text
+_N
+```
+
+很多时候就在表示：
+
+> Low Active。
+
+这是值得形成职业习惯的东西。
+
+------
+
+# 二十一、HAL 是什么
+
+例如你今天使用：
+
+```c
+HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
+```
+
+HAL：
+
+> **Hardware Abstraction Layer**
+
+硬件抽象层。
+
+ST 帮你封装了很多底层寄存器操作。
+
+例如：
+
+```c
+HAL_GPIO_WritePin()
+HAL_GPIO_TogglePin()
+HAL_UART_Transmit()
+HAL_ADC_Start()
+HAL_TIM_PWM_Start()
+```
+
+这样你不用每次直接操作寄存器。
+
+现在你的路线应该是：
+
+```text
+先熟练 HAL
+↓
+理解外设工作原理
+↓
+有需要再看寄存器/LL
+```
+
+而不是一上来背寄存器。
+
+这也符合你目前“能看懂、会用、最终能做工程”的目标。
+
+------
+
+# 二十二、`main()` 的基本结构必须看懂
+
+以后基本都会看到：
 
 ```c
 int main(void)
@@ -584,980 +1089,668 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
+    MX_USART3_UART_Init();
 
     while (1)
     {
 
     }
-}
-```
-
-实际生成内容会随工程配置不同而不同。
-
-今天先按人话理解：
-
-```text
-int main(void)
-↓
-程序主要入口
-
-
-HAL_Init();
-↓
-初始化HAL基础环境
-
-
-SystemClock_Config();
-↓
-配置系统时钟
-
-
-MX_xxx_Init();
-↓
-初始化你配置的各种外设
-
-
-while(1)
-↓
-程序进入无限循环
-```
-
-------
-
-# 十三、为什么 STM32 里面要有 while(1)
-
-你第一周 PC 程序经常：
-
-```c
-int main(void)
-{
-    ...
-    return 0;
-}
-```
-
-执行完程序就结束。
-
-但 MCU 不一样。
-
-STM32 上电以后通常需要一直工作：
-
-```text
-上电
- ↓
-初始化
- ↓
-while(1)
- ↓
-一直运行
- ↓
-直到掉电/复位
-```
-
-所以：
-
-```c
-while (1)
-{
 }
 ```
 
 可以理解成：
 
-> **MCU 的主循环。**
+```text
+main
+ ↓
+初始化 HAL
+ ↓
+初始化 Clock
+ ↓
+初始化外设
+ ↓
+进入 while(1)
+ ↓
+一直运行
+```
 
-这是今天非常重要的认知。
+而 MCU 和 PC 程序最大的区别之一就是：
 
-------
+> MCU 通常不会正常“运行结束”。
 
-# 十四、以后 FOC 是不是就全部写在 while(1)？
-
-不是。
-
-以后你会逐渐形成：
+而是：
 
 ```text
-main()
- ↓
-初始化
- ↓
+Power On
+↓
+Initialization
+↓
 while(1)
- ↓
-低速任务 / 状态管理 / 通信
+↓
+一直工作
+↓
+Power Off / Reset
 ```
 
-而真正高速电流环更可能：
-
-```text
-Timer / ADC Interrupt
-          ↓
-      Control ISR
-          ↓
-          FOC
-```
-
-也就是说：
-
-```text
-高速实时控制
-≠
-简单塞在 while(1)
-```
-
-现在先有这个意识。
+你之前学习计划里也专门强调了这个 MCU 主循环模型。
 
 ------
 
-# 十五、今天暂时不要修改 CubeMX 生成的大量代码
+# 二十三、今天碰到的第二个非常重要的坑：CubeMX 重生成代码
 
-STM32 自动生成代码里，你会看到类似：
+你发现：
+
+> 修改 `.ioc` 后，原来 `main.c` 里的代码消失。
+
+这件事必须牢记。
+
+CubeMX 会管理它生成的文件。
+
+因此你自己的代码优先写在：
 
 ```c
-/* USER CODE BEGIN 0 */
+/* USER CODE BEGIN xxx */
 
-/* USER CODE END 0 */
+/* USER CODE END xxx */
 ```
 
-以及：
+之间。
+
+例如：
+
+```c
+/* USER CODE BEGIN 3 */
+
+HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
+HAL_Delay(500);
+
+/* USER CODE END 3 */
+```
+
+CubeMX 重新生成代码时，通常会保护这些区域。原计划也明确提醒，自己写的程序应该优先放在这些 USER CODE 区域，否则重新 Generate Code 时可能被覆盖。
+
+------
+
+# 二十四、几个常见 USER CODE 区域
+
+### 自己的头文件
+
+```c
+/* USER CODE BEGIN Includes */
+
+#include "foc.h"
+#include "pi.h"
+
+/* USER CODE END Includes */
+```
+
+### 自己的变量
+
+```c
+/* USER CODE BEGIN PV */
+
+float iq_ref = 0.0f;
+
+/* USER CODE END PV */
+```
+
+### 外设初始化后的代码
 
 ```c
 /* USER CODE BEGIN 2 */
 
+HAL_TIM_PWM_Start(...);
+
 /* USER CODE END 2 */
 ```
 
-这种区域。
+### while 主循环
 
-这非常重要。
+```c
+/* USER CODE BEGIN 3 */
 
-以后我们自己代码优先放：
+...
+
+/* USER CODE END 3 */
+```
+
+------
+
+# 二十五、以后真正的大工程不要全部写 main.c
+
+这是今天从“初学”走向“工程”的一个非常重要认知。
+
+以后千万不要：
 
 ```text
-USER CODE BEGIN
-        ↓
-自己的代码
-        ↓
-USER CODE END
+main.c
+  3000行
 ```
 
-因为重新生成 CubeMX 代码的时候，这些区域通常会被保留。
+里面全都是：
 
-而你如果随便修改自动生成区：
+```text
+ADC
+PWM
+PI
+Clarke
+Park
+SVPWM
+Encoder
+FOC
+State Machine
+Fault
+UART
+```
 
-> 后面重新 Generate Code 时，自己的修改可能被覆盖。
+而应该逐渐变成：
 
-今天就要开始形成这个习惯。
+```text
+main.c
+│
+├── 初始化
+│
+├── 系统入口
+│
+└── 调用功能模块
+
+Control/
+├── pi.c
+├── transform.c
+├── svpwm.c
+└── foc.c
+
+Driver/
+├── pwm.c
+├── adc.c
+└── encoder.c
+```
+
+这样 CubeMX 再怎么修改：
+
+```text
+ADC
+TIM
+GPIO
+UART
+```
+
+你的：
+
+```text
+PI
+SVPWM
+FOC
+```
+
+这些自己创建的源文件都不会被它覆盖。
+
+这也是你第一周学习 `.c/.h` 模块化真正开始发挥价值的地方。
 
 ------
 
-# 十六、今天如果想放一个最简单的测试变量
+# 二十六、USART3 今天配置到了哪里
 
-可以在合适 USER CODE 区域放：
+今天已经配置：
 
-```c
-volatile uint32_t debug_counter = 0;
+```text
+Connectivity
+→ USART3
+→ Asynchronous
 ```
 
-然后主循环：
+参数：
 
-```c
-while (1)
-{
-    debug_counter++;
-}
+| 参数                  | 当前设置             |
+| --------------------- | -------------------- |
+| Baud Rate             | 115200               |
+| Word Length           | 8 Bits               |
+| Parity                | None                 |
+| Stop Bits             | 1                    |
+| Data Direction        | Receive and Transmit |
+| Hardware Flow Control | Disable              |
+
+也就是经常说：
+
+```text
+115200 8N1
 ```
 
-今天不需要 LED。
-
-这个变量只是为了等会 Debug。
-
-为什么我写：
-
-```c
-volatile
-```
-
-你第一周已经知道了。
-
-不过这里即使不用 `volatile`，普通逻辑也能运行；我们今天用它主要是方便 Debug 观察，并继续熟悉嵌入式写法。
+这个表达以后最好能直接看懂。
 
 ------
 
-# 十七、完整思想非常简单
+# 二十七、UART 是什么
 
-代码类似：
+UART：
 
-```c
-#include "main.h"
+> **Universal Asynchronous Receiver/Transmitter**
 
-/* USER CODE BEGIN PV */
+通用异步收发器。
 
-volatile uint32_t debug_counter = 0;
+最简单情况下：
 
-/* USER CODE END PV */
-
-
-int main(void)
-{
-    HAL_Init();
-
-    SystemClock_Config();
-
-    MX_GPIO_Init();
-
-    /* USER CODE BEGIN 2 */
-
-    debug_counter = 0;
-
-    /* USER CODE END 2 */
-
-
-    while (1)
-    {
-        /* USER CODE BEGIN WHILE */
-
-        debug_counter++;
-
-        /* USER CODE END WHILE */
-    }
-}
+```text
+TX
+RX
+GND
 ```
 
-**注意：不要把这整份覆盖到你 CubeIDE 自动生成的 `main.c` 上。**
+即可通信。
 
-你只需要把：
+### TX
+
+Transmit：
+
+> 发送。
+
+### RX
+
+Receive：
+
+> 接收。
+
+所以两个设备连接：
+
+```text
+STM32 TX ─── USB-TTL RX
+
+STM32 RX ─── USB-TTL TX
+
+STM32 GND ── USB-TTL GND
+```
+
+一定要：
+
+> **TX 接 RX，RX 接 TX。**
+
+还必须：
+
+> **共地。**
+
+“共地”是以后硬件调试中非常重要的概念。
+
+------
+
+# 二十八、115200 8N1 是什么意思
+
+```text
+115200
+```
+
+是 Baud Rate。
+
+可以简单理解成通信速率。
+
+```text
+8
+```
+
+代表 8 Data Bits。
+
+```text
+N
+```
+
+代表：
+
+```text
+No Parity
+```
+
+没有奇偶校验。
+
+```text
+1
+```
+
+代表：
+
+```text
+1 Stop Bit
+```
+
+所以：
+
+```text
+115200 8N1
+```
+
+就是非常常见的 UART 设置。
+
+------
+
+# 二十九、USART 和 UART 为什么名字不一样
+
+STM32 里面你经常看到：
+
+```text
+UART
+USART
+```
+
+USART：
+
+> Universal Synchronous/Asynchronous Receiver/Transmitter
+
+比普通 UART 多了：
+
+```text
+Synchronous
+```
+
+同步通信能力。
+
+但你今天设置：
+
+```text
+USART3
+→ Asynchronous
+```
+
+所以实际就是当普通 UART 在用。
+
+------
+
+# 三十、UART 为什么对电控软件工程师很重要
+
+UART 不一定承担最终产品最核心通信，但它是非常好的：
+
+> **Debug 通道。**
+
+比如以后电机不正常，可以串口打印：
+
+```text
+speed = 1000
+iq = 1.82
+id = 0.03
+Vdc = 24.1
+state = RUN
+fault = 0
+```
+
+这比：
+
+> “电机怎么不转，我猜是不是 PI 参数不对”
+
+专业得多。
+
+所以以后你会逐渐学会：
+
+```text
+变量
+↓
+UART
+↓
+PC
+↓
+实时观察
+```
+
+后面我们还会升级到：
+
+```text
+UART Interrupt
+UART DMA
+printf 重定向
+串口协议
+```
+
+------
+
+# 三十一、轮询 / Interrupt / DMA 以后要逐渐区分
+
+今天还没开始，但现在先有概念。
+
+例如：
 
 ```c
-volatile uint32_t debug_counter = 0;
+HAL_UART_Transmit()
 ```
+
+最简单的方式属于：
+
+> Blocking / Polling 思路。
+
+CPU 会参与等待发送完成。
+
+以后还会看到：
+
+```c
+HAL_UART_Transmit_IT()
+```
+
+Interrupt：
+
+> 通过中断完成通信。
 
 以及：
 
 ```c
-debug_counter++;
+HAL_UART_Transmit_DMA()
 ```
 
-放进对应 USER CODE 区域。
+DMA：
 
-STM32 工程从今天开始要养成：
+> 由 DMA 搬运数据，减少 CPU 负担。
 
-> **基于自动生成工程修改，而不是拿我一整份 main.c 强行覆盖。**
+在实时电机控制系统里，不能什么东西都：
 
-这个区别很重要。
+```text
+CPU一直等
+```
+
+因为 CPU 还要执行：
+
+```text
+ADC
+FOC
+PWM
+Protection
+Communication
+```
+
+所以未来你会逐渐形成：
+
+```text
+简单测试
+→ Polling
+
+异步事件
+→ Interrupt
+
+大量/持续数据
+→ DMA
+```
+
+这种工程判断。
 
 ------
 
-# 十八、然后第一次 Build
+# 三十二、今天最有价值的 Debug 案例
 
-执行：
+你今天遇到：
 
 ```text
-Build Project
+Build 成功
+ST-LINK 正常
+Download 正常
+
+但是
+
+LED 不亮
 ```
 
-最终最重要的是看：
+最终原因：
+
+> **GPIO 引脚配置错误。**
+
+这个案例建议你以后专门记在 Debug Log。
+
+因为它训练的是非常重要的排查方式：
 
 ```text
-0 Errors
-```
+Build是否成功？
+        ↓ YES
 
-Warnings 暂时也最好没有。
+Download是否成功？
+        ↓ YES
 
-如果出现错误，不要开始胡乱改。
+程序是否在运行？
+        ↓ YES
 
-以后统一按：
-
-```text
-第一条 Error
- ↓
-文件
- ↓
-行号
- ↓
-错误内容
-```
-
-来排查。
-
-**不要一次盯十几个后续错误。**
-
-很多时候第一个错误会引发后面十几个连锁错误。
-
-------
-
-# 十九、今天 Build 成功意味着什么
-
-它只能证明：
-
-> **代码语法/链接等基本上能够生成程序。**
-
-不代表：
-
-```text
-硬件一定正常
-GPIO一定正常
-电机一定正常
-```
-
-这是以后 Debug 很重要的思维：
-
-```text
-Build成功
-≠
-功能正确
-```
-
-------
-
-# 二十、下一步：ST-LINK 连接
-
-你要让：
-
-```text
-PC
- ↓
-ST-LINK
- ↓
-STM32
-```
-
-真正连起来。
-
-今天目标不是研究 SWD 协议。
-
-只需要确认：
-
-> CubeIDE 能识别目标芯片。
-
-------
-
-# 二十一、第一次 Download / Run
-
-Build 成功以后：
-
-```text
-Run
-```
-
-或者 Debug 下载程序。
-
-CubeIDE 会把程序烧入 STM32 Flash。
-
-你可以简单理解：
-
-```text
-电脑里的程序文件
+GPIO配置是否正确？
         ↓
-ST-LINK
+
+原理图Pin是否对应？
         ↓
-写入STM32 Flash
-        ↓
-MCU复位
-        ↓
-从main开始运行
+找到问题
 ```
 
-这一步成功非常重要。
+以后电机控制真正 Debug 也一样。
 
-因为意味着：
+不要一下子：
 
-> **你的 PC → 编译器 → ST-LINK → MCU 整条开发链已经打通。**
+> “肯定是 FOC 算法问题。”
 
-------
-
-# 二十二、今天最重要的实验：第一次断点
-
-在：
-
-```c
-debug_counter++;
-```
-
-这一行设置：
-
-> Breakpoint
-
-然后进入：
+而要：
 
 ```text
-Debug
-```
-
-程序应该运行到这里停下来。
-
-如果成功：
-
-> 你第一次真正控制住 MCU 的执行过程。
-
-------
-
-# 二十三、此时观察 debug_counter
-
-打开：
-
-```text
-Variables
-```
-
-或者：
-
-```text
-Expressions / Watch
-```
-
-加入：
-
-```text
-debug_counter
-```
-
-假设现在：
-
-```text
-debug_counter = 0
-```
-
-单步一下：
-
-```text
-debug_counter = 1
-```
-
-再：
-
-```text
-2
-```
-
-再：
-
-```text
-3
-```
-
-这就是：
-
-> **Debugger 真的正在读 MCU RAM 里的变量。**
-
-这个感觉一定建立起来。
-
-------
-
-# 二十四、今天顺便认识 Step Over
-
-光标停在：
-
-```c
-debug_counter++;
-```
-
-点：
-
-```text
-Step Over
-```
-
-程序执行这一行并停到下一行/下一次可停位置。
-
-今天先会用：
-
-- Breakpoint
-- Resume/Continue
-- Step Over
-
-就够。
-
-真正 Debugger 专项在 Day 6。
-
-------
-
-# 二十五、今天不要研究寄存器
-
-Debug 页面里可能看到：
-
-```text
-Registers
-Memory
-Disassembly
-SFR
-```
-
-今天统统不用点。
-
-不要因为：
-
-> “感觉专业”
-
-就开始看寄存器。
-
-你的路线是：
-
-```text
-先会用 HAL
+电源
 ↓
-先跑通工程
+驱动
 ↓
-以后需要的时候再下钻
-```
-
-不是一上来研究 ARM Cortex-M4 底层。
-
-------
-
-# 二十六、今天最需要真正搞懂的一张图
-
-```text
-你写：
-
-main.c
-   ↓
-
-CubeIDE Build
-   ↓
-
-Compiler + Linker
-   ↓
-
-生成 MCU 程序
-   ↓
-
-ST-LINK
-   ↓
-
-写入 STM32 Flash
-   ↓
-
-STM32 Reset
-   ↓
-
-main()
-   ↓
-
-初始化
-   ↓
-
-while(1)
-   ↓
-
-不断执行
-```
-
-今天如果这条链理解了，就已经很成功。
-
-------
-
-# 二十七、Day 1 的几个修改实验
-
-今天还是保持我们的原则：
-
-> 不默写，重点会改。
-
-### 实验 1
-
-原来：
-
-```c
-debug_counter++;
-```
-
-改：
-
-```c
-debug_counter += 10;
-```
-
-再 Debug。
-
-预测：
-
-```text
-0
-10
-20
-30
-...
-```
-
-------
-
-### 实验 2
-
-改：
-
-```c
-debug_counter += 100;
-```
-
-预测结果。
-
-------
-
-### 实验 3
-
-设置：
-
-```c
-volatile uint8_t motor_enable = 0;
-```
-
-然后：
-
-```c
-motor_enable = 1;
-```
-
-在 Debug 里观察：
-
-```text
-0 → 1
-```
-
-这里没有真实启动电机。
-
-只是开始使用：
-
-> 电机工程命名。
-
-------
-
-### 实验 4
-
-增加：
-
-```c
-float iq_ref = 2.0f;
-```
-
-在 Watch 里查看：
-
-```text
-iq_ref = 2
-```
-
-然后改：
-
-```c
-iq_ref = 3.0f;
-```
-
-重新 Build / Download / Debug。
-
-你会开始体会：
-
-```text
-修改代码
+Pin
 ↓
-Build
+PWM
 ↓
-Flash
+ADC
 ↓
-Debug
+Encoder
 ↓
-观察
+软件
+↓
+控制算法
 ```
 
-这就是以后半年每天都会重复的开发流程。
+逐层定位。
+
+这比会背很多 HAL API 更能体现工程能力。
 
 ------
 
-# 二十八、今天不要碰 GPIO
+# 三十三、以后每次修改 `.ioc` 的标准操作流程
 
-即使工程里已经自动生成：
-
-```c
-MX_GPIO_Init();
-```
-
-也不要今天就研究 LED。
-
-Day 2 专门做：
-
-> GPIO + LED Blink
-
-今天只验证：
+建议你以后固定形成肌肉记忆：
 
 ```text
-MCU工程能创建
-编译能成功
-芯片能连接
-程序能烧录
-Debugger能停
-变量能观察
+① 确认当前代码已经保存
+
+② 如果当前功能已经稳定
+   → Git Commit
+
+③ 打开 .ioc
+
+④ 修改 GPIO / TIM / ADC / UART 等配置
+
+⑤ Ctrl + S
+
+⑥ CubeMX Generate Code
+
+⑦ 检查自己的 USER CODE 是否还在
+
+⑧ Build
+
+⑨ Download
+
+⑩ 实机验证
+
+⑪ Debug
+
+⑫ 功能确认正常
+
+⑬ Git Commit
 ```
 
-把开发链打通。
+你的半年计划要求的核心也正是：
+
+> **不要复制很多工程保存版本，而是让一个主工程持续演进，每个功能对应一个清晰 Commit。**
 
 ------
 
-# 二十九、今天的 Debug Log
+# 三十四、你以后找工作最好能够讲出的专业表达
 
-建议建立：
+假如面试官问：
 
-```text
-Debug_Log/
-└── Week02_Debug.md
-```
+> 你平时 STM32 怎么开发？
 
-今天可以先写：
+以后你应该逐渐能够自然回答成：
 
-```markdown
-# Week 2 Debug Log
+> 我目前主要使用 STM32CubeIDE 和 CubeMX 完成 STM32G431 的外设配置，基于 HAL 库开发。通过 `.ioc` 配置系统时钟、GPIO、UART、Timer、ADC 等外设，生成初始化代码后，在用户代码区域以及独立功能模块中实现应用逻辑。程序通过 ST-LINK 和 SWD 下载调试，开发过程中会使用断点、Watch 和实机信号验证进行问题定位。
 
-## Day 1 - STM32G431 Project Setup
+这段话已经比：
 
-### MCU
-STM32G431xxxx
+> “我用过 STM32，会点灯。”
 
-### IDE
-STM32CubeIDE
+专业很多。
 
-### Debugger
-ST-LINK
+以后半年我们还会把它升级成：
 
-### Result
-- Project created
-- Build passed
-- Download passed
-- Debug connected
-- Breakpoint passed
+> 我基于 STM32G431 搭建 PMSM FOC 控制软件，TIM1 产生三相互补 PWM，ADC 由 PWM 定时触发同步采样，相电流经过 Clarke/Park 变换进入 dq 电流 PI，随后通过逆 Park 和 SVPWM 更新 PWM，占空比在控制 ISR 内周期计算……
 
-### Problems
-无 / 实际出现的问题
-
-### Current Stable State
-STM32G431 empty base project runs successfully
-```
-
-如果今天遇到问题，就真实写，不要为了好看写“无”。
+到了这个阶段，你才能真正拿着这个项目去谈电控软件岗位。
 
 ------
 
-# 三十、Day 1 今天的 Git Commit
+# 三十五、今天结束时你真正应该记住的 12 件事
 
-今天所有东西确认：
-
-```text
-Build
-✅
-
-Download
-✅
-
-Debug
-✅
-```
-
-以后再 Commit。
-
-先：
-
-```bash
-git status
-```
-
-检查。
-
-然后：
-
-```bash
-git add -A
-```
-
-然后：
-
-```bash
-git commit -m "Initialize STM32G431 firmware project"
-```
-
-最后：
-
-```bash
-git push
-```
-
-这个 Commit 非常重要。
-
-以后它就是：
-
-> **你的 STM32G431 最初始稳定工程。**
+1. **`.ioc` 是 CubeMX 的硬件配置文件。**
+2. **Build 是编译链接，不等于实机功能正确。**
+3. **Download 是把程序写进 STM32 Flash。**
+4. **ST-LINK 既能烧录，也能在线 Debug。**
+5. **SWD 主要使用 SWDIO、SWCLK 等信号进行调试。**
+6. **GPIO 引脚必须对照原理图，不能凭感觉选。**
+7. **GPIO 一个 Pin 可以复用成多种外设功能。**
+8. **Push-Pull 可以主动输出 High 和 Low。**
+9. **STM32G431 当前通过 HSI + PLL 配置到了 170 MHz。**
+10. **自己的代码优先放 `USER CODE BEGIN/END`，否则 CubeMX 重新生成可能覆盖。**
+11. **真正的大型 FOC 程序以后要拆成 `.c/.h` 模块，不要全堆在 `main.c`。**
+12. **UART 最基本的连接规则是 TX→RX、RX→TX、GND→GND，今天已经完成 USART3 的 115200 8N1 初步配置。**
 
 ------
 
-# 三十一、为什么这个版本以后非常有用
+## 当前项目检查点
 
-比如未来 Week 3 PWM 配坏了。
-
-或者 Week 4 ADC 搞出问题。
-
-你永远知道：
+你现在的进度可以记成：
 
 ```text
-Initialize STM32G431 firmware project
+STM32G431CBU6 Project            ✅
+STM32CubeIDE                     ✅
+.ioc 基础使用                    ✅
+170 MHz Clock                    ✅
+SWD / ST-LINK                    ✅
+Build                            ✅
+Download                         ✅
+GPIO Output                      ✅
+LED Blink 实机                   ✅
+发现并解决 GPIO Pin 配置错误     ✅
+理解 USER CODE 防覆盖机制        ✅
+
+USART3 Asynchronous              ✅ 配置
+USART3 115200 8N1                ✅ 配置
+
+USB-TTL 实机连接                 ⬜
+Hello Motor Control 串口发送     ⬜
+周期 Counter 输出                ⬜
+Timer Interrupt                  ⬜
 ```
 
-这个版本至少：
+所以**我们下一次不用重复今天任何东西**。
 
-```text
-Build正常
-ST-LINK正常
-MCU正常
-Debug正常
-```
+下一次直接从：
 
-所以出现问题时，可以判断：
+> **USART3 实机通信：STM32 → USB-TTL → 电脑串口助手看到 `Hello Motor Control`**
 
-> 是后来外设配置导致的，而不是最基础的环境就有问题。
+开始。
 
-这就是 Git 真正的工程价值。
-
-------
-
-# 三十二、今天建议投入时间
-
-大约 **2～3 小时**。
-
-### 第 1 阶段：20～30 min
-
-整理目录：
-
-```text
-Firmware/
-├── practice/Week01_C/
-└── PMSM_FOC_G431/
-```
-
-------
-
-### 第 2 阶段：30～40 min
-
-创建 STM32G431 工程。
-
-认识：
-
-```text
-.ioc
-Core
-Drivers
-main.c
-```
-
-------
-
-### 第 3 阶段：20～30 min
-
-第一次：
-
-```text
-Build
-```
-
-确保：
-
-```text
-0 Errors
-```
-
-------
-
-### 第 4 阶段：30～40 min
-
-连接 ST-LINK。
-
-第一次：
-
-```text
-Download
-Debug
-```
-
-------
-
-### 第 5 阶段：30 min
-
-使用：
-
-```c
-debug_counter
-```
-
-训练：
-
-```text
-Breakpoint
-Watch
-Step Over
-Continue
-```
-
-------
-
-### 第 6 阶段：15 min
-
-写：
-
-```text
-Week02_Debug.md
-```
-
-然后 Git Commit。
-
-------
-
-# 三十三、Day 1 验收题
-
-今天结束以后，你应该能回答：
-
-1. CubeIDE 是干什么的？
-2. CubeMX/ioc 配置主要干什么？
-3. Build 和 Download 有什么区别？
-4. ST-LINK 是干什么的？
-5. STM32 的代码最终存在哪里？
-6. `main()` 是什么？
-7. 为什么 MCU 常有 `while(1)`？
-8. `USER CODE BEGIN/END` 为什么重要？
-9. Breakpoint 是什么？
-10. Watch/Expressions 是干什么的？
-11. 为什么 `Build成功 ≠ 功能一定正确`？
-12. 为什么今天确认正常以后要 Commit？
-
-如果能回答 9～10 个：
-
-> **Week 2 Day 1 就通过。**
-
-------
-
-# 三十四、Day 1 真正的成果不是代码量
-
-今天甚至可能只真正手动加：
-
-```c
-volatile uint32_t debug_counter = 0;
-```
-
-和：
-
-```c
-debug_counter++;
-```
-
-但这完全没问题。
-
-因为今天真正获得的是：
-
-```text
-第一次真正 STM32 工程
-+
-第一次 Build
-+
-第一次烧录
-+
-第一次 Debug
-+
-第一次观察 MCU 变量
-+
-第一个稳定固件 Commit
-```
-
-这比今天写 200 行代码重要得多。
-
-**Day 2 再正式开始 GPIO：找到你这块开发板实际 LED 对应的 GPIO，引脚配置、Push-Pull、Output Level、`HAL_GPIO_WritePin()` / `HAL_GPIO_TogglePin()`，最后让真实 LED 按 100 ms / 500 ms / 1000 ms 三种周期闪烁。**
+跑通 UART 以后，如果你理解得快，我们当天继续 **Timer + 1 ms Interrupt**；如果 Timer 某一步需要消化，就在那里多停一会。以后整个半年计划都按这种节奏推进，而不是为了凑“Day 1～Day 7”人为拖慢或者赶进度。

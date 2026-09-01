@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,14 +42,35 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim6;
+
+UART_HandleTypeDef huart3;
+
+
+
 
 /* USER CODE BEGIN PV */
 
+ //Private Variables
+// uint32_t counter = 0;  //计数变量
+
+volatile uint32_t timer_counter = 0;
+volatile uint8_t uart_send_flag = 0;
+
+uint32_t seconds_counter = 0;
+char tx_buffer[50];    //准备发送给电脑的一小块字符缓冲区
+
+
 /* USER CODE END PV */
+
+
+
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -85,7 +108,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART3_UART_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
+
 
   /* USER CODE END 2 */
 
@@ -96,8 +123,39 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
-	    HAL_Delay(500);
+	    //HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
+	    //HAL_Delay(500); //LED test
+
+	    /*	    int len = snprintf(tx_buffer,
+	                       sizeof(tx_buffer),
+	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一行
+						                         // 串口输出经常组合使用
+	                       counter);
+	    HAL_UART_Transmit(&huart3,
+	                      (uint8_t *)tx_buffer,
+	                      len,
+	                      HAL_MAX_DELAY);
+	    counter++;
+	    HAL_Delay(1000);*/
+
+	    if (uart_send_flag)
+	    {
+	        uart_send_flag = 0;
+
+	        seconds_counter++;
+
+	        int len = snprintf(tx_buffer,
+	                           sizeof(tx_buffer),
+	                           "Seconds = %lu\r\n",
+	                           seconds_counter);
+
+	        HAL_UART_Transmit(&huart3,
+	                          (uint8_t *)tx_buffer,
+	                          len,
+	                          HAL_MAX_DELAY);
+	    }
+
+
   }
   /* USER CODE END 3 */
 }
@@ -149,6 +207,92 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 169;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -161,6 +305,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
@@ -177,9 +322,28 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
+
+
 /* USER CODE BEGIN 4 */
 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)
+    {
+        timer_counter++;
+
+        if (timer_counter >= 1000)
+        {
+            timer_counter = 0;
+            uart_send_flag = 1;
+        }
+    }
+}
+
+
 /* USER CODE END 4 */
+
+
 
 /**
   * @brief  This function is executed in case of error occurrence.
