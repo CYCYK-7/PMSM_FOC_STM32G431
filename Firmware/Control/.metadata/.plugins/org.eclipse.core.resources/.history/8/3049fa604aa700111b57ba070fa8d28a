@@ -59,13 +59,14 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�????
+char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�???
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
 uint32_t vdc_mv = 0;
 
 volatile uint16_t adc_dma_value = 0;
+uint32_t adc_mv = 0;
 
 /* USER CODE END PV */
 
@@ -119,6 +120,8 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM4_Init();
   MX_ADC1_Init();
+
+
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);// Truly activate the PWM output of TIM4 Channel 1. INIT only be used to configure TIM4
@@ -128,8 +131,6 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1,
                     (uint32_t *)&adc_dma_value,
                     1);
-  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT);
-  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
 
   /* USER CODE END 2 */
 
@@ -145,7 +146,7 @@ int main(void)
 
 	    /*	    int len = snprintf(tx_buffer,
 	                       sizeof(tx_buffer),
-	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�????
+	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�???
 						                         // 串口输出经常组合使用
 	                       counter);
 	    HAL_UART_Transmit(&huart3,
@@ -180,7 +181,7 @@ int main(void)
 
 		  int len = snprintf(tx_buffer,
 							 sizeof(tx_buffer),
-							 "DMA ADC = %u, Vadc = %lu mV\r\n",
+							 "DMA = %u, Vadc = %lu mV\r\n",
 							 adc_dma_value,
 							 (unsigned long)adc_mv);
 
@@ -189,6 +190,7 @@ int main(void)
 							len,
 							HAL_MAX_DELAY);
 
+	      HAL_ADC_Stop(&hadc1);
 	  }
 
   }
