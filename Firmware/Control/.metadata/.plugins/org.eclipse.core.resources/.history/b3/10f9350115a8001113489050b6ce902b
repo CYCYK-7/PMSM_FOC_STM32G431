@@ -61,15 +61,14 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�??????
+char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�?????
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
 uint32_t vdc_mv = 0;
 
 volatile uint16_t adc_dma_buffer[2] = {0};
-uint32_t vdc_adc_mv = 0;
-uint32_t current_adc_mv = 0;
+
 
 /* USER CODE END PV */
 
@@ -126,27 +125,17 @@ int main(void)
   MX_ADC1_Init();
   MX_OPAMP1_Init();
   /* USER CODE BEGIN 2 */
-
-
   HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);// Truly activate the PWM output of TIM4 Channel 1. INIT only be used to configure TIM4
   //__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2125);  // used to modify CCR
 
-  /* 启动U相电流采样运�? */
-  HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不�?
-
-  /* ADC校准 */
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);  //校准
-
-  /* 启动双�?�道ADC + DMA */
   HAL_ADC_Start_DMA(&hadc1,
                     (uint32_t *)&adc_dma_buffer,
                     2);
-  /* 当前实验不需要DMA完成中断 */
-  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运�?
+
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运行
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
-
-
 
   /* USER CODE END 2 */
 
@@ -162,7 +151,7 @@ int main(void)
 
 	    /*	    int len = snprintf(tx_buffer,
 	                       sizeof(tx_buffer),
-	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�??????
+	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�?????
 						                         // 串口输出经常组合使用
 	                       counter);
 	    HAL_UART_Transmit(&huart3,
@@ -326,7 +315,6 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = ADC_REGULAR_RANK_2;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
