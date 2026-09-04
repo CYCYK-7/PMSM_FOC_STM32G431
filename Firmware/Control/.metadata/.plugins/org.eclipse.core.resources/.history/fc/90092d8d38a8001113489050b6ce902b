@@ -70,7 +70,7 @@ uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
 uint32_t vdc_mv = 0;
 
-volatile uint16_t adc1_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
+volatile uint16_t adc_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
 uint32_t vdc_adc_mv = 0;
 uint32_t current_adc_mv = 0;
 
@@ -93,9 +93,6 @@ int32_t iv_adc_delta = 0;
 
 int32_t iu_ma = 0;
 int32_t iv_ma = 0;
-
-uint16_t u_raw;
-uint16_t v_raw;
 
 /* USER CODE END PV */
 
@@ -172,7 +169,7 @@ int main(void)
 
   /* 启动双�?�道ADC + DMA */
   HAL_ADC_Start_DMA(&hadc1,
-                    (uint32_t *)&adc1_dma_buffer,
+                    (uint32_t *)&adc_dma_buffer,
                     2);
   HAL_ADC_Start_DMA(&hadc2,
                     (uint32_t *)&adc2_dma_value,
@@ -302,27 +299,24 @@ int main(void)
 	  {
 	      uart_send_flag = 0;
 
-	      uint16_t u_raw = adc1_dma_buffer[1];
-	      uint16_t v_raw = adc2_dma_value;
-
 	      iu_adc_delta =
-	          (int32_t)u_raw -
+	          (int32_t)adc1_dma_buffer[1] -
 	          (int32_t)u_offset_adc;
 
 	      iv_adc_delta =
-	          (int32_t)v_raw -
+	          (int32_t)adc2_dma_value -
 	          (int32_t)v_offset_adc;
 
-	      iu_ma = iu_adc_delta * 2198L / 100L;
-	      iv_ma = iv_adc_delta * 2198L / 100L;
+	      iu_ma = iu_adc_delta * 2198 / 100;
+	      iv_ma = iv_adc_delta * 2198 / 100;
 
 	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
 	                         "U=%u/%u, Iu=%ld mA | V=%u/%u, Iv=%ld mA\r\n",
-	                         u_raw,
+	                         adc1_dma_buffer[1],
 	                         u_offset_adc,
 	                         (long)iu_ma,
-	                         v_raw,
+	                         adc2_dma_value,
 	                         v_offset_adc,
 	                         (long)iv_ma);
 

@@ -43,12 +43,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
-ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
-DMA_HandleTypeDef hdma_adc2;
 
 OPAMP_HandleTypeDef hopamp1;
-OPAMP_HandleTypeDef hopamp2;
 
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
@@ -64,38 +61,15 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�???????
+char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�??????
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
 uint32_t vdc_mv = 0;
 
-volatile uint16_t adc1_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
+volatile uint16_t adc_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 Raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
 uint32_t vdc_adc_mv = 0;
 uint32_t current_adc_mv = 0;
-
-//uint32_t current_offset_sum = 0;
-//uint16_t current_offset_adc = 0;
-
-//int32_t current_adc_delta = 0;
-//int32_t current_ma = 0;
-
-volatile uint16_t adc2_dma_value = 0;
-
-uint32_t u_offset_sum = 0;
-uint32_t v_offset_sum = 0;
-
-uint16_t u_offset_adc = 0;
-uint16_t v_offset_adc = 0;
-
-int32_t iu_adc_delta = 0;
-int32_t iv_adc_delta = 0;
-
-int32_t iu_ma = 0;
-int32_t iv_ma = 0;
-
-uint16_t u_raw;
-uint16_t v_raw;
 
 /* USER CODE END PV */
 
@@ -108,8 +82,6 @@ static void MX_TIM6_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_OPAMP1_Init(void);
-static void MX_ADC2_Init(void);
-static void MX_OPAMP2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -153,8 +125,6 @@ int main(void)
   MX_TIM4_Init();
   MX_ADC1_Init();
   MX_OPAMP1_Init();
-  MX_ADC2_Init();
-  MX_OPAMP2_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -162,55 +132,21 @@ int main(void)
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);// Truly activate the PWM output of TIM4 Channel 1. INIT only be used to configure TIM4
   //__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2125);  // used to modify CCR
 
-  /* 启动U相电流采样运�?? */
-  HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不�??
-  HAL_OPAMP_Start(&hopamp2);
+  /* 启动U相电流采样运�? */
+  HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不�?
 
   /* ADC校准 */
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);  //校准
-  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
 
   /* 启动双�?�道ADC + DMA */
   HAL_ADC_Start_DMA(&hadc1,
-                    (uint32_t *)&adc1_dma_buffer,
+                    (uint32_t *)&adc_dma_buffer,
                     2);
-  HAL_ADC_Start_DMA(&hadc2,
-                    (uint32_t *)&adc2_dma_value,
-                    1);
   /* 当前实验不需要DMA完成中断 */
-  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运�??
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运�?
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
 
-  __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_HT);
-  __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_TC);
 
-  /*HAL_Delay(10);
-
-  current_offset_sum = 0;
-
-  for (uint16_t i = 0; i < 1000; i++)  // order to reduce the impact of noise.
-  {
-      current_offset_sum += adc_dma_buffer[1];
-      HAL_Delay(1);
-  }
-
-  current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark */
-
-  HAL_Delay(10);
-
-  u_offset_sum = 0;
-  v_offset_sum = 0;
-
-  for (uint16_t i = 0; i < 1000; i++)
-  {
-      u_offset_sum += adc1_dma_buffer[1];
-      v_offset_sum += adc2_dma_value;
-
-      HAL_Delay(1);
-  }
-
-  u_offset_adc = u_offset_sum / 1000;
-  v_offset_adc = v_offset_sum / 1000;
 
   /* USER CODE END 2 */
 
@@ -226,7 +162,7 @@ int main(void)
 
 	    /*	    int len = snprintf(tx_buffer,
 	                       sizeof(tx_buffer),
-	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�???????
+	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�??????
 						                         // 串口输出经常组合使用
 	                       counter);
 	    HAL_UART_Transmit(&huart3,
@@ -252,7 +188,7 @@ int main(void)
 	                          len,
 	                          HAL_MAX_DELAY);
 	    }*/
-	 /* if (uart_send_flag) // used to verify multi-channal ADC
+	  if (uart_send_flag)
 	  {
 	      uart_send_flag = 0;
 
@@ -265,66 +201,9 @@ int main(void)
 	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
 	                         "VDC_ADC=%u, Current_ADC=%u, Current_V=%lu mV\r\n",
-	                         adc_dma_buffer[0], // ADC raw value after bus voltage division
-	                         adc_dma_buffer[1], // ADC raw value output by U-phase current operational amplifier
-	                         (unsigned long)current_adc_mv);
-
-	      HAL_UART_Transmit(&huart3,
-	                        (uint8_t *)tx_buffer,
-	                        len,
-	                        HAL_MAX_DELAY);
-	  }*/
-	 /* if (uart_send_flag)
-	  {
-	      uart_send_flag = 0;
-
-	      current_adc_delta =
-	          (int32_t)adc_dma_buffer[1] -
-	          (int32_t)current_offset_adc;
-
-	      current_ma =
-	          current_adc_delta * 2198 / 100;
-
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "Raw=%u, Offset=%u, Delta=%ld, I=%ld mA\r\n",
+	                         adc_dma_buffer[0],
 	                         adc_dma_buffer[1],
-	                         current_offset_adc,
-	                         (long)current_adc_delta,
-	                         (long)current_ma);
-
-	      HAL_UART_Transmit(&huart3,
-	                        (uint8_t *)tx_buffer,
-	                        len,
-	                        HAL_MAX_DELAY);
-	  }*/
-	  if (uart_send_flag)
-	  {
-	      uart_send_flag = 0;
-
-	      uint16_t u_raw = adc1_dma_buffer[1];
-	      uint16_t v_raw = adc2_dma_value;
-
-	      iu_adc_delta =
-	          (int32_t)u_raw -
-	          (int32_t)u_offset_adc;
-
-	      iv_adc_delta =
-	          (int32_t)v_raw -
-	          (int32_t)v_offset_adc;
-
-	      iu_ma = iu_adc_delta * 2198L / 100L;
-	      iv_ma = iv_adc_delta * 2198L / 100L;
-
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "U=%u/%u, Iu=%ld mA | V=%u/%u, Iv=%ld mA\r\n",
-	                         u_raw,
-	                         u_offset_adc,
-	                         (long)iu_ma,
-	                         v_raw,
-	                         v_offset_adc,
-	                         (long)iv_ma);
+	                         (unsigned long)current_adc_mv);
 
 	      HAL_UART_Transmit(&huart3,
 	                        (uint8_t *)tx_buffer,
@@ -460,65 +339,6 @@ static void MX_ADC1_Init(void)
 }
 
 /**
-  * @brief ADC2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC2_Init(void)
-{
-
-  /* USER CODE BEGIN ADC2_Init 0 */
-
-  /* USER CODE END ADC2_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC2_Init 1 */
-
-  /* USER CODE END ADC2_Init 1 */
-
-  /** Common config
-  */
-  hadc2.Instance = ADC2;
-  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
-  hadc2.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc2.Init.GainCompensation = 0;
-  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  hadc2.Init.LowPowerAutoWait = DISABLE;
-  hadc2.Init.ContinuousConvMode = ENABLE;
-  hadc2.Init.NbrOfConversion = 1;
-  hadc2.Init.DiscontinuousConvMode = DISABLE;
-  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc2.Init.DMAContinuousRequests = DISABLE;
-  hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc2.Init.OversamplingMode = DISABLE;
-  if (HAL_ADC_Init(&hadc2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_3;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
-  sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.OffsetNumber = ADC_OFFSET_NONE;
-  sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC2_Init 2 */
-
-  /* USER CODE END ADC2_Init 2 */
-
-}
-
-/**
   * @brief OPAMP1 Initialization Function
   * @param None
   * @retval None
@@ -548,39 +368,6 @@ static void MX_OPAMP1_Init(void)
   /* USER CODE BEGIN OPAMP1_Init 2 */
 
   /* USER CODE END OPAMP1_Init 2 */
-
-}
-
-/**
-  * @brief OPAMP2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_OPAMP2_Init(void)
-{
-
-  /* USER CODE BEGIN OPAMP2_Init 0 */
-
-  /* USER CODE END OPAMP2_Init 0 */
-
-  /* USER CODE BEGIN OPAMP2_Init 1 */
-
-  /* USER CODE END OPAMP2_Init 1 */
-  hopamp2.Instance = OPAMP2;
-  hopamp2.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
-  hopamp2.Init.Mode = OPAMP_STANDALONE_MODE;
-  hopamp2.Init.InvertingInput = OPAMP_INVERTINGINPUT_IO0;
-  hopamp2.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
-  hopamp2.Init.InternalOutput = DISABLE;
-  hopamp2.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
-  hopamp2.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
-  if (HAL_OPAMP_Init(&hopamp2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN OPAMP2_Init 2 */
-
-  /* USER CODE END OPAMP2_Init 2 */
 
 }
 
@@ -733,9 +520,6 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-  /* DMA1_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 
 }
 

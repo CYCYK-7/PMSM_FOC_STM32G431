@@ -70,15 +70,15 @@ uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
 uint32_t vdc_mv = 0;
 
-volatile uint16_t adc1_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
+volatile uint16_t adc_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
 uint32_t vdc_adc_mv = 0;
 uint32_t current_adc_mv = 0;
 
-//uint32_t current_offset_sum = 0;
-//uint16_t current_offset_adc = 0;
+uint32_t current_offset_sum = 0;
+uint16_t current_offset_adc = 0;
 
-//int32_t current_adc_delta = 0;
-//int32_t current_ma = 0;
+int32_t current_adc_delta = 0;
+int32_t current_ma = 0;
 
 volatile uint16_t adc2_dma_value = 0;
 
@@ -93,9 +93,6 @@ int32_t iv_adc_delta = 0;
 
 int32_t iu_ma = 0;
 int32_t iv_ma = 0;
-
-uint16_t u_raw;
-uint16_t v_raw;
 
 /* USER CODE END PV */
 
@@ -172,7 +169,7 @@ int main(void)
 
   /* 启动双�?�道ADC + DMA */
   HAL_ADC_Start_DMA(&hadc1,
-                    (uint32_t *)&adc1_dma_buffer,
+                    (uint32_t *)&adc_dma_buffer,
                     2);
   HAL_ADC_Start_DMA(&hadc2,
                     (uint32_t *)&adc2_dma_value,
@@ -184,7 +181,7 @@ int main(void)
   __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_HT);
   __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_TC);
 
-  /*HAL_Delay(10);
+  HAL_Delay(10);
 
   current_offset_sum = 0;
 
@@ -194,23 +191,8 @@ int main(void)
       HAL_Delay(1);
   }
 
-  current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark */
+  current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark
 
-  HAL_Delay(10);
-
-  u_offset_sum = 0;
-  v_offset_sum = 0;
-
-  for (uint16_t i = 0; i < 1000; i++)
-  {
-      u_offset_sum += adc1_dma_buffer[1];
-      v_offset_sum += adc2_dma_value;
-
-      HAL_Delay(1);
-  }
-
-  u_offset_adc = u_offset_sum / 1000;
-  v_offset_adc = v_offset_sum / 1000;
 
   /* USER CODE END 2 */
 
@@ -274,7 +256,7 @@ int main(void)
 	                        len,
 	                        HAL_MAX_DELAY);
 	  }*/
-	 /* if (uart_send_flag)
+	  if (uart_send_flag)
 	  {
 	      uart_send_flag = 0;
 
@@ -297,40 +279,8 @@ int main(void)
 	                        (uint8_t *)tx_buffer,
 	                        len,
 	                        HAL_MAX_DELAY);
-	  }*/
-	  if (uart_send_flag)
-	  {
-	      uart_send_flag = 0;
-
-	      uint16_t u_raw = adc1_dma_buffer[1];
-	      uint16_t v_raw = adc2_dma_value;
-
-	      iu_adc_delta =
-	          (int32_t)u_raw -
-	          (int32_t)u_offset_adc;
-
-	      iv_adc_delta =
-	          (int32_t)v_raw -
-	          (int32_t)v_offset_adc;
-
-	      iu_ma = iu_adc_delta * 2198L / 100L;
-	      iv_ma = iv_adc_delta * 2198L / 100L;
-
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "U=%u/%u, Iu=%ld mA | V=%u/%u, Iv=%ld mA\r\n",
-	                         u_raw,
-	                         u_offset_adc,
-	                         (long)iu_ma,
-	                         v_raw,
-	                         v_offset_adc,
-	                         (long)iv_ma);
-
-	      HAL_UART_Transmit(&huart3,
-	                        (uint8_t *)tx_buffer,
-	                        len,
-	                        HAL_MAX_DELAY);
 	  }
+
 
   }
   /* USER CODE END 3 */
