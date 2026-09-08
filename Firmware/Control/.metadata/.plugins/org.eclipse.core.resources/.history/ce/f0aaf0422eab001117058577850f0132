@@ -174,10 +174,6 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 850);   // 20%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 2125);  // 50%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 3400);  // 80%
-
   /* 启动U相电流采样运suan */
   HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不dui
   HAL_OPAMP_Start(&hopamp2);
