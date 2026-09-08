@@ -895,19 +895,19 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+/*void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
-        timer_counter++; //1ms 1times
+        timer_counter++;
 
-        if (timer_counter >= 1000) //1s
+        if (timer_counter >= 1000)
         {
             timer_counter = 0;
             uart_send_flag = 1;
         }
     }
-}
+}*/
 
 
 

@@ -66,7 +66,7 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[50];    //准备发给电脑的一小块字符缓冲qu
+char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�???????????
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
@@ -84,9 +84,6 @@ uint32_t current_adc_mv = 0;
 
 volatile uint16_t adc2_dma_value = 0;
 
-volatile uint16_t iu_raw_sync = 0;
-volatile uint16_t iv_raw_sync = 0;
-
 volatile uint32_t iu_offset_sum = 0;
 volatile uint32_t iv_offset_sum = 0;
 
@@ -99,13 +96,13 @@ volatile int32_t iv_adc_delta = 0;
 volatile int32_t iu_ma = 0;
 volatile int32_t iv_ma = 0;
 
+uint16_t u_raw;
+uint16_t v_raw;
 
-volatile uint32_t current_offset_count = 0;
 volatile uint32_t adc_injected_count = 0; // the number of times ADC synchronous sampling occurs
 
-volatile uint8_t current_offset_done = 0;
-
-volatile uint8_t current_sample_ready = 0;
+volatile uint16_t iu_raw_sync = 0;
+volatile uint16_t iv_raw_sync = 0;
 
 
 /* USER CODE END PV */
@@ -187,12 +184,14 @@ int main(void)
                     1);
 
   /* 当前实验不需要DMA完成中断 */
-  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运xing
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运�??????
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
   __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_HT);
   __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_TC);
 
-  HAL_ADCEx_InjectedStart_IT(&hadc2);
+  /* 4. ADC2 injected：等待TIM1触发，但暂时不用它产生中�? */
+  HAL_ADCEx_InjectedStart(&hadc2);
+  /* 5. ADC1 injected：等待TIM1触发，并�?启转换完成中�? */
   HAL_ADCEx_InjectedStart_IT(&hadc1);
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -228,8 +227,7 @@ int main(void)
 
   current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark */
 
-
-  /*HAL_Delay(10);
+  HAL_Delay(10);
 
   u_offset_sum = 0;
   v_offset_sum = 0;
@@ -243,7 +241,7 @@ int main(void)
   }
 
   u_offset_adc = u_offset_sum / 1000;
-  v_offset_adc = v_offset_sum / 1000; */
+  v_offset_adc = v_offset_sum / 1000;
 
   /* USER CODE END 2 */
 
@@ -335,15 +333,28 @@ int main(void)
 	  {
 	      uart_send_flag = 0;
 
+	      uint16_t u_raw = adc1_dma_buffer[1];
+	      uint16_t v_raw = adc2_dma_value;
+
+	      iu_adc_delta =
+	          (int32_t)u_raw -
+	          (int32_t)u_offset_adc;
+
+	      iv_adc_delta =
+	          (int32_t)v_raw -
+	          (int32_t)v_offset_adc;
+
+	      iu_ma = iu_adc_delta * 2198L / 100L;
+	      iv_ma = iv_adc_delta * 2198L / 100L;
+
 	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
-	                         "U=%u OffU=%u Iu=%ld mA | "
-	                         "V=%u OffV=%u Iv=%ld mA\r\n",
-	                         iu_raw_sync,
-	                         iu_offset_adc,
+	                         "U=%u/%u, Iu=%ld mA | V=%u/%u, Iv=%ld mA\r\n",
+	                         u_raw,
+	                         u_offset_adc,
 	                         (long)iu_ma,
-	                         iv_raw_sync,
-	                         iv_offset_adc,
+	                         v_raw,
+	                         v_offset_adc,
 	                         (long)iv_ma);
 
 	      HAL_UART_Transmit(&huart3,
@@ -895,21 +906,19 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+/*void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
-        timer_counter++; //1ms 1times
+        timer_counter++;
 
-        if (timer_counter >= 1000) //1s
+        if (timer_counter >= 1000)
         {
             timer_counter = 0;
             uart_send_flag = 1;
         }
     }
-}
-
-
+}*/
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
@@ -919,66 +928,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             HAL_ADCEx_InjectedGetValue(&hadc1,
                                        ADC_INJECTED_RANK_1);
 
-        current_sample_ready |= 0x01;
-    }
-
-    if (hadc->Instance == ADC2)
-    {
         iv_raw_sync =
             HAL_ADCEx_InjectedGetValue(&hadc2,
                                        ADC_INJECTED_RANK_1);
 
-        current_sample_ready |= 0x02;
-    }
-
-    /* U、V两相本周期数据都已经到齐 */
-    if (current_sample_ready == 0x03)
-    {
-        current_sample_ready = 0;
-
         adc_injected_count++;
-
-        /* ---------- Offset calibration ---------- */
-        if (!current_offset_done)
-        {
-            iu_offset_sum += iu_raw_sync;
-            iv_offset_sum += iv_raw_sync;
-
-            current_offset_count++;
-
-            if (current_offset_count >= CURRENT_OFFSET_SAMPLES)
-            {
-                iu_offset_adc =
-                    (uint16_t)(iu_offset_sum / CURRENT_OFFSET_SAMPLES);
-
-                iv_offset_adc =
-                    (uint16_t)(iv_offset_sum / CURRENT_OFFSET_SAMPLES);
-
-                current_offset_done = 1;
-            }
-        }
-
-        /* ---------- Current calculation ---------- */
-        else
-        {
-            iu_adc_delta =
-                (int32_t)iu_raw_sync - (int32_t)iu_offset_adc;
-
-            iv_adc_delta =
-                (int32_t)iv_raw_sync - (int32_t)iv_offset_adc;
-
-            /*
-             * Current Board：
-             * Rsense = 5mΩ
-             * OPAMP Gain ≈ 7.33
-             *
-             * ≈ 21.98 mA / ADC count
-             */
-            iu_ma = iu_adc_delta * 2198L / 100L;
-            iv_ma = iv_adc_delta * 2198L / 100L;
-        }
     }
 }
+
 
 /* USER CODE END 4 */
 

@@ -66,7 +66,7 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[50];    //准备发给电脑的一小块字符缓冲qu
+char tx_buffer[50];    //准备发�?�给电脑的一小块字符缓冲�???????????
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
@@ -228,8 +228,7 @@ int main(void)
 
   current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark */
 
-
-  /*HAL_Delay(10);
+  HAL_Delay(10);
 
   u_offset_sum = 0;
   v_offset_sum = 0;
@@ -243,7 +242,7 @@ int main(void)
   }
 
   u_offset_adc = u_offset_sum / 1000;
-  v_offset_adc = v_offset_sum / 1000; */
+  v_offset_adc = v_offset_sum / 1000;
 
   /* USER CODE END 2 */
 
@@ -895,19 +894,19 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+/*void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
-        timer_counter++; //1ms 1times
+        timer_counter++;
 
-        if (timer_counter >= 1000) //1s
+        if (timer_counter >= 1000)
         {
             timer_counter = 0;
             uart_send_flag = 1;
         }
     }
-}
+}*/
 
 
 
