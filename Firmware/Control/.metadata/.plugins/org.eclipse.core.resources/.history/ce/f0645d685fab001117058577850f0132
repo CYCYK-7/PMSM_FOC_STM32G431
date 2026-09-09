@@ -23,7 +23,6 @@
 /* USER CODE BEGIN Includes */
 
 #include <stdio.h>
-#include "foc_math.h"
 
 /* USER CODE END Includes */
 
@@ -67,7 +66,7 @@ volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
 uint32_t seconds_counter = 0;
-char tx_buffer[100];    //准备发给电脑的一小块字符缓冲qu
+char tx_buffer[50];    //准备发给电脑的一小块字符缓冲qu
 
 uint32_t adc_raw = 0;
 uint32_t adc_mv = 0;
@@ -108,11 +107,6 @@ volatile uint8_t current_offset_done = 0;
 
 volatile uint8_t current_sample_ready = 0;
 
-//-----------------------------------------------
-volatile float iu_a = 0.0f;
-volatile float iv_a = 0.0f;
-
-AlphaBeta_t i_ab = {0};
 
 /* USER CODE END PV */
 
@@ -341,7 +335,7 @@ int main(void)
 	  {
 	      uart_send_flag = 0;
 
-	      /*int len = snprintf(tx_buffer,
+	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
 	                         "U=%u OffU=%u Iu=%ld mA | "
 	                         "V=%u OffV=%u Iv=%ld mA\r\n",
@@ -350,14 +344,7 @@ int main(void)
 	                         (long)iu_ma,
 	                         iv_raw_sync,
 	                         iv_offset_adc,
-	                         (long)iv_ma);*/
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "Iu=%.3f Iv=%.3f | Ia=%.3f Ib=%.3f\r\n",
-	                         iu_a,
-	                         iv_a,
-	                         i_ab.alpha,
-	                         i_ab.beta);
+	                         (long)iv_ma);
 
 	      HAL_UART_Transmit(&huart3,
 	                        (uint8_t *)tx_buffer,
@@ -932,7 +919,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             HAL_ADCEx_InjectedGetValue(&hadc1,
                                        ADC_INJECTED_RANK_1);
 
-        current_sample_ready |= 0x01; //01
+        current_sample_ready |= 0x01;
     }
 
     if (hadc->Instance == ADC2)
@@ -941,11 +928,11 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             HAL_ADCEx_InjectedGetValue(&hadc2,
                                        ADC_INJECTED_RANK_1);
 
-        current_sample_ready |= 0x02; //10
+        current_sample_ready |= 0x02;
     }
 
     /* U、V两相本周期数据都已经到齐 */
-    if (current_sample_ready == 0x03) // 11
+    if (current_sample_ready == 0x03)
     {
         current_sample_ready = 0;
 
@@ -989,16 +976,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
              */
             iu_ma = iu_adc_delta * 2198L / 100L;
             iv_ma = iv_adc_delta * 2198L / 100L;
-
-            /* mA -> A */
-            iu_a = (float)iu_ma * 0.001f;
-            iv_a = (float)iv_ma * 0.001f;
-
-            /* Clarke Transform */
-            Clarke_Run(iu_a,
-                       iv_a,
-                       &i_ab);
-
         }
     }
 }

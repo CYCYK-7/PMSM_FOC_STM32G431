@@ -1,0 +1,27 @@
+/*
+ * foc_math.h
+ *
+ *  Created on: Sep 8, 2026
+ *      Author: CYC.YK
+ */
+
+#ifndef INC_FOC_MATH_H_
+#define INC_FOC_MATH_H_
+
+
+
+typedef struct
+{
+    float alpha;
+    float beta;
+
+} AlphaBeta_t;
+
+
+void Clarke_Run(float iu,
+                float iv,
+                AlphaBeta_t *out);
+
+
+
+#endif /* INC_FOC_MATH_H_ */
