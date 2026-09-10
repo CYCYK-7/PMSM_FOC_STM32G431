@@ -119,12 +119,6 @@ volatile float theta_e_test = 0.0f; //test angle
 volatile float theta_e_step = 0.0f;
 
 
-AlphaBeta_t v_ab = {0};
-volatile float vd_cmd = 0.0f;
-volatile float vq_cmd = 1.0f;
-
-
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -362,19 +356,13 @@ int main(void)
 	                         iv_raw_sync,
 	                         iv_offset_adc,
 	                         (long)iv_ma);*/
-	      /*int len = snprintf(tx_buffer,
+	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
 	                         "Iu=%.3f Iv=%.3f | Ia=%.3f Ib=%.3f\r\n",
 	                         iu_a,
 	                         iv_a,
 	                         i_ab.alpha,
-	                         i_ab.beta);*/
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "Theta=%.3f | Id=%.3f Iq=%.3f\r\n",
-	                         theta_e_test,
-	                         i_dq.d,
-	                         i_dq.q);
+	                         i_ab.beta);
 
 	      HAL_UART_Transmit(&huart3,
 	                        (uint8_t *)tx_buffer,
@@ -1030,19 +1018,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
                      i_ab.beta,
                      theta_e_test,
                      &i_dq);
-
-            /* Temporary dq voltage commands
-             * Later these will come from current PI controllers.
-             */
-            vd_cmd = 0.0f;
-            vq_cmd = 1.0f;
-
-
-            /* Inverse Park */
-            InvPark_Run(vd_cmd,
-                        vq_cmd,
-                        theta_e_test,
-                        &v_ab);
 
         }
     }

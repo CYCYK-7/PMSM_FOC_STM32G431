@@ -119,12 +119,6 @@ volatile float theta_e_test = 0.0f; //test angle
 volatile float theta_e_step = 0.0f;
 
 
-AlphaBeta_t v_ab = {0};
-volatile float vd_cmd = 0.0f;
-volatile float vq_cmd = 1.0f;
-
-
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1030,19 +1024,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
                      i_ab.beta,
                      theta_e_test,
                      &i_dq);
-
-            /* Temporary dq voltage commands
-             * Later these will come from current PI controllers.
-             */
-            vd_cmd = 0.0f;
-            vq_cmd = 1.0f;
-
-
-            /* Inverse Park */
-            InvPark_Run(vd_cmd,
-                        vq_cmd,
-                        theta_e_test,
-                        &v_ab);
 
         }
     }

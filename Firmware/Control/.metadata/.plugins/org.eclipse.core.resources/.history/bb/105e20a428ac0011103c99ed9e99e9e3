@@ -17,27 +17,11 @@ typedef struct
 
 } AlphaBeta_t;
 
-typedef struct
-{
-    float d;
-    float q;
-
-} DQ_t;
-
 
 void Clarke_Run(float iu,
                 float iv,
                 AlphaBeta_t *out);
 
-void Park_Run(float alpha,
-              float beta,
-              float theta_e,
-              DQ_t *out);
-
-void InvPark_Run(float d,
-                 float q,
-                 float theta_e,
-                 AlphaBeta_t *out);
 
 
 #endif /* INC_FOC_MATH_H_ */

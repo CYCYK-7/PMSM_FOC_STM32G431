@@ -8,7 +8,6 @@
 
 
 #include "foc_math.h"
-#include <math.h>
 
 #define ONE_BY_SQRT3  0.577350269f
 
@@ -38,21 +37,4 @@ void Park_Run(float alpha,
     out->q =
         -alpha * sin_theta
         + beta * cos_theta;
-}
-
-void InvPark_Run(float d,
-                 float q,
-                 float theta_e,
-                 AlphaBeta_t *out)
-{
-    float sin_theta = sinf(theta_e);
-    float cos_theta = cosf(theta_e);
-
-    out->alpha =
-        d * cos_theta
-        - q * sin_theta;
-
-    out->beta =
-        d * sin_theta
-        + q * cos_theta;
 }

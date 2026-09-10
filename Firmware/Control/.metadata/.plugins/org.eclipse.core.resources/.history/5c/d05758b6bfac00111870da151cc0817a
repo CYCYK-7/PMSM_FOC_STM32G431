@@ -34,10 +34,5 @@ void Park_Run(float alpha,
               float theta_e,
               DQ_t *out);
 
-void InvPark_Run(float d,
-                 float q,
-                 float theta_e,
-                 AlphaBeta_t *out);
-
 
 #endif /* INC_FOC_MATH_H_ */

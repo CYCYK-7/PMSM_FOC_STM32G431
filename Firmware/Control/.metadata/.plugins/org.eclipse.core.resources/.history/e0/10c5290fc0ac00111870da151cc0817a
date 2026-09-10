@@ -8,7 +8,6 @@
 
 
 #include "foc_math.h"
-#include <math.h>
 
 #define ONE_BY_SQRT3  0.577350269f
 
