@@ -1,0 +1,94 @@
+/*
+ * pi_controller.c
+ *
+ *  Created on: 2026年9月10日
+ *      Author: CYC.YK
+ */
+
+
+#include "pi_controller.h"
+
+
+void PI_Init(PI_Controller_t *pi,
+             float kp,
+             float ki,
+             float output_min,
+             float output_max)
+{
+    pi->kp = kp;
+    pi->ki = ki;
+
+    pi->integral = 0.0f;
+
+    pi->output_min = output_min;
+    pi->output_max = output_max;
+
+    pi->output = 0.0f;
+}
+
+
+float PI_Run(PI_Controller_t *pi,
+             float ref,
+             float feedback,
+             float ts)
+{
+    float error;
+    float proportional;
+    float integral_new;
+    float output_unsat;
+
+    error = ref - feedback;
+
+    proportional = pi->kp * error;
+
+    integral_new =
+        pi->integral
+        + pi->ki * ts * error;
+
+    output_unsat =
+        proportional
+        + integral_new;
+
+
+    /* Upper saturation */
+    if (output_unsat > pi->output_max)
+    {
+        pi->output = pi->output_max;
+
+        /*
+         * Only allow integration when the error
+         * tends to move the controller out of saturation.
+         */
+        if (error < 0.0f)
+        {
+            pi->integral = integral_new;
+        }
+    }
+
+    /* Lower saturation */
+    else if (output_unsat < pi->output_min)
+    {
+        pi->output = pi->output_min;
+
+        if (error > 0.0f)
+        {
+            pi->integral = integral_new;
+        }
+    }
+
+    /* Normal operation */
+    else
+    {
+        pi->integral = integral_new;
+        pi->output = output_unsat;
+    }
+
+    return pi->output;
+}
+
+
+void PI_Reset(PI_Controller_t *pi)
+{
+    pi->integral = 0.0f;
+    pi->output = 0.0f;
+}

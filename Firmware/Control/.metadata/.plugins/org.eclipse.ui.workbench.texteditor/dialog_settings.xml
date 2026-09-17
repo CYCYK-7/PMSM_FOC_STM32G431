@@ -1,13 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <section name="Workbench">
 	<section name="org.eclipse.ui.texteditor.FindReplaceDialog">
-		<item key="selection" value="uart_send_flag"/>
+		<item key="selection" value="__HAL_TIM_SET_COMPARE"/>
 		<item key="wrap" value="true"/>
 		<item key="casesensitive" value="false"/>
 		<item key="wholeword" value="false"/>
 		<item key="incremental" value="false"/>
 		<item key="isRegEx" value="false"/>
 		<list key="findhistory">
+			<item value="__HAL_TIM_SET_COMPARE"/>
+			<item value="iu_raw_sync"/>
+			<item value="adc_mv"/>
+			<item value="adc_raw"/>
+			<item value="pi_id"/>
+			<item value="vq_cmd"/>
+			<item value="v_alpha_cmd"/>
 			<item value="uart_send_flag"/>
 			<item value="u_raw"/>
 		</list>

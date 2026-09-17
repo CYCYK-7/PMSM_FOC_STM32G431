@@ -24,11 +24,29 @@
 
 #include <stdio.h>
 #include "foc_math.h"
+#include "pi_controller.h"
+#include "svpwm.h"
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef enum
+{
+    FOC_STATE_INIT = 0,
+
+    FOC_STATE_CALIBRATION,
+
+    FOC_STATE_READY,
+
+    FOC_STATE_RUN,
+
+    FOC_STATE_FAULT
+
+} FOC_State_t;
+
+
 
 /* USER CODE END PTD */
 
@@ -60,8 +78,21 @@ UART_HandleTypeDef huart3;
 /* USER CODE BEGIN PV */
 
 #define CURRENT_OFFSET_SAMPLES  1000U
+#define CURRENT_LOOP_TS  0.00005f // 1/20khz
+
+#define ADC_FULL_SCALE       4095.0f
+#define ADC_VREF             3.3f
+
+#define VDC_R_HIGH           75.0f
+#define VDC_R_LOW            3.0f
+
+#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频率
+
+#define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
+
  //Private Variables
 // uint32_t counter = 0;  //计数变量
+
 
 volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
@@ -69,21 +100,7 @@ volatile uint8_t uart_send_flag = 0;
 uint32_t seconds_counter = 0;
 char tx_buffer[100];    //准备发给电脑的一小块字符缓冲qu
 
-uint32_t adc_raw = 0;
-uint32_t adc_mv = 0;
-uint32_t vdc_mv = 0;
 
-volatile uint16_t adc1_dma_buffer[2] = {0};//[0] corresponds to ADC_IN1 raw ADC Value [1] corresponds to ADC_IN3 raw ADC value
-uint32_t vdc_adc_mv = 0;
-uint32_t current_adc_mv = 0;
-
-//uint32_t current_offset_sum = 0;
-//uint16_t current_offset_adc = 0;
-
-//int32_t current_adc_delta = 0;
-//int32_t current_ma = 0;
-
-volatile uint16_t adc2_dma_value = 0;
 
 volatile uint16_t iu_raw_sync = 0;
 volatile uint16_t iv_raw_sync = 0;
@@ -119,11 +136,36 @@ volatile float theta_e_test = 0.0f; //test angle
 volatile float theta_e_step = 0.0f;
 
 
-AlphaBeta_t v_ab = {0};
+AlphaBeta_t v_ab = {0}; //InvPark原始输出
 volatile float vd_cmd = 0.0f;
-volatile float vq_cmd = 1.0f;
+volatile float vq_cmd = 0.0f;
 
 
+PI_Controller_t pi_id;
+PI_Controller_t pi_iq;
+volatile float id_ref = 0.0f;
+volatile float iq_ref = 0.0f;
+
+
+SVPWM_Output_t svpwm_out = {0};
+volatile uint32_t pwm_ccr_u = 0;
+volatile uint32_t pwm_ccr_v = 0;
+volatile uint32_t pwm_ccr_w = 0;
+
+float v_alpha_cmd = 0.0f; //最终送给SVPWM的电压
+float v_beta_cmd  = 0.0f;
+
+volatile uint8_t foc_enable = 0;//目前没有接入真正的角度，还没有真正的电机闭环
+
+
+volatile uint16_t vdc_adc_raw = 0;
+volatile float vdc_bus = 0.0f;
+
+volatile FOC_State_t foc_state = FOC_STATE_INIT;
+
+volatile uint8_t foc_start_request = 0;
+volatile uint8_t foc_stop_request  = 0;
+volatile uint8_t foc_fault_request = 0;
 
 /* USER CODE END PV */
 
@@ -139,12 +181,181 @@ static void MX_OPAMP1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_OPAMP2_Init(void);
 static void MX_TIM1_Init(void);
+
 /* USER CODE BEGIN PFP */
+
+static uint32_t DutyToCCR(float duty);
+
+static void FOC_ResetControl(void);
+static void FOC_SetNeutralPWM(void);
+static void FOC_StateManager(void);
+
+
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
+static uint32_t DutyToCCR(float duty)
+{
+    uint32_t arr;
+    uint32_t period;
+    uint32_t ccr;
+
+    arr =
+        __HAL_TIM_GET_AUTORELOAD(&htim1);
+
+    period =
+        arr + 1U;
+
+
+    if (duty < 0.0f)
+    {
+        duty = 0.0f;
+    }
+
+    if (duty > 1.0f)
+    {
+        duty = 1.0f;
+    }
+
+
+    ccr =
+        (uint32_t)(duty * (float)period);
+
+
+    if (ccr > arr)
+    {
+        ccr = arr;
+    }
+
+
+    return ccr;
+}
+
+
+static void FOC_ResetControl(void)
+{
+    PI_Reset(&pi_id);
+    PI_Reset(&pi_iq);
+
+    vd_cmd = 0.0f;
+    vq_cmd = 0.0f;
+
+    v_alpha_cmd = 0.0f;
+    v_beta_cmd  = 0.0f;
+}
+
+static void FOC_SetNeutralPWM(void)
+{
+    uint32_t arr;
+    uint32_t mid;
+
+    arr =
+        __HAL_TIM_GET_AUTORELOAD(&htim1);
+
+    mid =
+        (arr + 1U) / 2U;
+
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_1,
+                          mid);
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_2,
+                          mid);
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_3,
+                          mid);
+}
+
+static void FOC_StateManager(void)
+{
+    /* ---------- Global fault request ---------- */
+    if (foc_fault_request)
+    {
+        foc_fault_request = 0;
+
+        FOC_ResetControl();
+        FOC_SetNeutralPWM();
+
+        foc_state = FOC_STATE_FAULT;  //
+    }
+
+
+    switch (foc_state)
+    {
+        case FOC_STATE_INIT:
+        {
+            /* Initialization is handled in main() */
+            break;
+        }
+
+
+        case FOC_STATE_CALIBRATION:
+        {
+            /* Offset calibration is handled
+             * inside ADC injected ISR.  //偏移校准在ADC注入式ISR内部处理
+             */
+            break;
+        }
+
+
+        case FOC_STATE_READY:
+        {
+            if (foc_start_request)
+            {
+                foc_start_request = 0;
+
+                FOC_ResetControl();
+
+                foc_state = FOC_STATE_RUN;
+            }
+
+            break;
+        }
+
+
+        case FOC_STATE_RUN:
+        {
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+
+                foc_state = FOC_STATE_READY;
+            }
+
+            break;
+        }
+
+
+        case FOC_STATE_FAULT:
+        {
+            FOC_ResetControl();
+            FOC_SetNeutralPWM();
+
+            break;
+        }
+
+
+        default:
+        {
+            FOC_ResetControl();
+            FOC_SetNeutralPWM();
+
+            foc_state = FOC_STATE_FAULT;
+
+            break;
+        }
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -187,6 +398,30 @@ int main(void)
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 
+  theta_e_step = 6.283185307f / 20000.0f;
+
+  PI_Init(&pi_id,
+          25.13f,
+          3769.9f,
+          -5.0f,
+          5.0f);
+
+  PI_Init(&pi_iq,
+          25.13f,
+          3769.9f,
+          -5.0f,
+          5.0f);
+
+  FOC_ResetControl();
+  FOC_SetNeutralPWM();
+
+  current_offset_done  = 0;
+  current_offset_count = 0;
+
+  iu_offset_sum = 0;
+  iv_offset_sum = 0;
+  foc_state = FOC_STATE_CALIBRATION;  //init之后statemanager进入calibration
+
   /* 启动U相电流采样运suan */
   HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不dui
   HAL_OPAMP_Start(&hopamp2);
@@ -197,17 +432,12 @@ int main(void)
 
   /* 启动双tong道ADC + DMA */
   HAL_ADC_Start_DMA(&hadc1,
-                    (uint32_t *)&adc1_dma_buffer,
-                    2);
-  HAL_ADC_Start_DMA(&hadc2,
-                    (uint32_t *)&adc2_dma_value,
+                    (uint32_t *)&vdc_adc_raw,
                     1);
 
   /* 当前实验不需要DMA完成中断 */
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运xing
   __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
-  __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_HT);
-  __HAL_DMA_DISABLE_IT(&hdma_adc2, DMA_IT_TC);
 
   HAL_ADCEx_InjectedStart_IT(&hadc2);
   HAL_ADCEx_InjectedStart_IT(&hadc1);
@@ -225,42 +455,9 @@ int main(void)
   //__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2125);  // used to modify CCR
 
 
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 850);   // 20%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 2125);  // 50%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 3400);  // 80%
 
 
 
-  theta_e_step = 6.283185307f / 20000.0f;
-
-  /*HAL_Delay(10);
-
-  current_offset_sum = 0;
-
-  for (uint16_t i = 0; i < 1000; i++)  // order to reduce the impact of noise.
-  {
-      current_offset_sum += adc_dma_buffer[1];
-      HAL_Delay(1);
-  }
-
-  current_offset_adc = current_offset_sum / 1000; // treat this as the 0A benchmark */
-
-
-  /*HAL_Delay(10);
-
-  u_offset_sum = 0;
-  v_offset_sum = 0;
-
-  for (uint16_t i = 0; i < 1000; i++)
-  {
-      u_offset_sum += adc1_dma_buffer[1];
-      v_offset_sum += adc2_dma_value;
-
-      HAL_Delay(1);
-  }
-
-  u_offset_adc = u_offset_sum / 1000;
-  v_offset_adc = v_offset_sum / 1000; */
 
   /* USER CODE END 2 */
 
@@ -274,101 +471,12 @@ int main(void)
 	    //HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
 	    //HAL_Delay(500); //LED test
 
-	    /*	    int len = snprintf(tx_buffer,
-	                       sizeof(tx_buffer),
-	                       "Counter = %lu\r\n",  // 输出unsigned long 类型整数。\r 回到当前行开 \n 换到下一�???????????
-						                         // 串口输出经常组合使用
-	                       counter);
-	    HAL_UART_Transmit(&huart3,
-	                      (uint8_t *)tx_buffer,
-	                      len,
-	                      HAL_MAX_DELAY);
-	    counter++;
-	    HAL_Delay(1000);*/
+	  FOC_StateManager();//状态机
 
-	   /* if (uart_send_flag)
-	    {
-	        uart_send_flag = 0;
-
-	        seconds_counter++;
-
-	        int len = snprintf(tx_buffer,
-	                           sizeof(tx_buffer),
-	                           "Seconds = %lu\r\n",
-	                           seconds_counter);
-
-	        HAL_UART_Transmit(&huart3,
-	                          (uint8_t *)tx_buffer,
-	                          len,
-	                          HAL_MAX_DELAY);
-	    }*/
-	 /* if (uart_send_flag) // used to verify multi-channal ADC
-	  {
-	      uart_send_flag = 0;
-
-	      vdc_adc_mv =
-	          adc_dma_buffer[0] * 3300UL / 4095UL;
-
-	      current_adc_mv =
-	          adc_dma_buffer[1] * 3300UL / 4095UL;
-
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "VDC_ADC=%u, Current_ADC=%u, Current_V=%lu mV\r\n",
-	                         adc_dma_buffer[0], // ADC raw value after bus voltage division
-	                         adc_dma_buffer[1], // ADC raw value output by U-phase current operational amplifier
-	                         (unsigned long)current_adc_mv);
-
-	      HAL_UART_Transmit(&huart3,
-	                        (uint8_t *)tx_buffer,
-	                        len,
-	                        HAL_MAX_DELAY);
-	  }*/
-	 /* if (uart_send_flag)
-	  {
-	      uart_send_flag = 0;
-
-	      current_adc_delta =
-	          (int32_t)adc_dma_buffer[1] -
-	          (int32_t)current_offset_adc;
-
-	      current_ma =
-	          current_adc_delta * 2198 / 100;
-
-	      int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "Raw=%u, Offset=%u, Delta=%ld, I=%ld mA\r\n",
-	                         adc_dma_buffer[1],
-	                         current_offset_adc,
-	                         (long)current_adc_delta,
-	                         (long)current_ma);
-
-	      HAL_UART_Transmit(&huart3,
-	                        (uint8_t *)tx_buffer,
-	                        len,
-	                        HAL_MAX_DELAY);
-	  }*/
 	  if (uart_send_flag)
 	  {
 	      uart_send_flag = 0;
 
-	      /*int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "U=%u OffU=%u Iu=%ld mA | "
-	                         "V=%u OffV=%u Iv=%ld mA\r\n",
-	                         iu_raw_sync,
-	                         iu_offset_adc,
-	                         (long)iu_ma,
-	                         iv_raw_sync,
-	                         iv_offset_adc,
-	                         (long)iv_ma);*/
-	      /*int len = snprintf(tx_buffer,
-	                         sizeof(tx_buffer),
-	                         "Iu=%.3f Iv=%.3f | Ia=%.3f Ib=%.3f\r\n",
-	                         iu_a,
-	                         iv_a,
-	                         i_ab.alpha,
-	                         i_ab.beta);*/
 	      int len = snprintf(tx_buffer,
 	                         sizeof(tx_buffer),
 	                         "Theta=%.3f | Id=%.3f Iq=%.3f\r\n",
@@ -969,7 +1077,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         adc_injected_count++;
 
         /* ---------- Offset calibration ---------- */
-        if (!current_offset_done)
+        if (foc_state == FOC_STATE_CALIBRATION)
         {
             iu_offset_sum += iu_raw_sync;
             iv_offset_sum += iv_raw_sync;
@@ -985,66 +1093,154 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
                     (uint16_t)(iv_offset_sum / CURRENT_OFFSET_SAMPLES);
 
                 current_offset_done = 1;
+
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+
+                foc_state = FOC_STATE_READY;//after calibration state manager into ready
             }
+            /*
+             * 很重要：
+             * CALIBRATION 状态做到这里就结束本次ADC回调。
+             * 不继续算电流、Park、PI。
+             */
+            return;
+        }
+
+        /* ==================================================
+         * 2. INIT / FAULT 状态直接退出
+         * ================================================== */
+        if ((foc_state == FOC_STATE_INIT) ||
+            (foc_state == FOC_STATE_FAULT))
+        {
+            return;
         }
 
         /* ---------- Current calculation ---------- */
-        else
-        {
-            iu_adc_delta =
-                (int32_t)iu_raw_sync - (int32_t)iu_offset_adc;
+        /* ==================================================
+         * 3. READY 和 RUN 都允许走到这里
+         *    所以继续计算实际电流
+         * ================================================== */
 
-            iv_adc_delta =
-                (int32_t)iv_raw_sync - (int32_t)iv_offset_adc;
+		iu_adc_delta =
+			(int32_t)iu_raw_sync - (int32_t)iu_offset_adc;
 
-            /*
-             * Current Board：
-             * Rsense = 5mΩ
-             * OPAMP Gain ≈ 7.33
-             *
-             * ≈ 21.98 mA / ADC count
-             */
-            iu_ma = iu_adc_delta * 2198L / 100L;
-            iv_ma = iv_adc_delta * 2198L / 100L;
+		iv_adc_delta =
+			(int32_t)iv_raw_sync - (int32_t)iv_offset_adc;
 
-            /* mA -> A */
-            iu_a = (float)iu_ma * 0.001f;
-            iv_a = (float)iv_ma * 0.001f;
+		/*
+		 * Current Board：
+		 * Rsense = 5mΩ
+		 * OPAMP Gain ≈ 7.33
+		 *
+		 * ≈ 21.98 mA / ADC count
+		 */
+		iu_ma = iu_adc_delta * 2198L / 100L;
+		iv_ma = iv_adc_delta * 2198L / 100L;
 
-            /* Clarke Transform */
-            Clarke_Run(iu_a,
-                       iv_a,
-                       &i_ab);
+		/* mA -> A */
+		iu_a = (float)iu_ma * 0.001f;
+		iv_a = (float)iv_ma * 0.001f;
 
-            /* Test electrical angle */ // Generally, angles are normalized to 0-2pai
-            theta_e_test += theta_e_step;
+		/* Clarke Transform */
+		Clarke_Run(iu_a,
+				   iv_a,
+				   &i_ab);
 
-            if (theta_e_test >= 6.283185307f)
-            {
-                theta_e_test -= 6.283185307f;
-            }
+		/* Test electrical angle */ // Generally, angles are normalized to 0-2pai
+		theta_e_test += theta_e_step;
 
-
-            /* Park Transform */
-            Park_Run(i_ab.alpha,
-                     i_ab.beta,
-                     theta_e_test,
-                     &i_dq);
-
-            /* Temporary dq voltage commands
-             * Later these will come from current PI controllers.
-             */
-            vd_cmd = 0.0f;
-            vq_cmd = 1.0f;
+		if (theta_e_test >= 6.283185307f)
+		{
+			theta_e_test -= 6.283185307f;
+		}
 
 
-            /* Inverse Park */
-            InvPark_Run(vd_cmd,
-                        vq_cmd,
-                        theta_e_test,
-                        &v_ab);
+		/* Park Transform */
+		Park_Run(i_ab.alpha,
+				 i_ab.beta,
+				 theta_e_test,
+				 &i_dq);
 
-        }
+		/* ==================================================
+		 * 4. READY 状态到这里停止
+		 * ================================================== */
+		if (foc_state == FOC_STATE_READY)
+		{
+			return;
+		}
+
+
+		/* ==================================================
+		 * 5. 只有 RUN 才允许继续执行PI
+		 * ================================================== */
+		if (foc_state != FOC_STATE_RUN)
+		{
+			return;
+		}
+
+		/* Temporary dq voltage commands
+		 * Later these will come from current PI controllers.
+		 */
+
+		/* Current controller */
+
+		/* d-axis current PI */
+		vd_cmd =
+			PI_Run(&pi_id,
+				   id_ref,
+				   i_dq.d,
+				   CURRENT_LOOP_TS);
+		/* q-axis current PI */
+		vq_cmd =
+			PI_Run(&pi_iq,
+				   iq_ref,
+				   i_dq.q,
+				   CURRENT_LOOP_TS);
+
+		vdc_bus =
+			(float)vdc_adc_raw
+			* VDC_VOLTS_PER_COUNT;
+
+
+		/* Inverse Park */
+		InvPark_Run(vd_cmd,
+					vq_cmd,
+					theta_e_test,
+					&v_ab);
+
+		/* Copy voltage command */
+		v_alpha_cmd = v_ab.alpha;
+		v_beta_cmd  = v_ab.beta;
+
+
+		/* Voltage vector limitation */
+		SVPWM_LimitVoltage(&v_alpha_cmd,
+						   &v_beta_cmd,
+						   vdc_bus);
+
+		SVPWM_Run(v_alpha_cmd,
+				  v_beta_cmd,
+				  vdc_bus,
+				  &svpwm_out);
+
+		pwm_ccr_u =
+			DutyToCCR(svpwm_out.duty_u);
+		pwm_ccr_v =
+			DutyToCCR(svpwm_out.duty_v);
+		pwm_ccr_w =
+			DutyToCCR(svpwm_out.duty_w);
+
+
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_1,
+							  pwm_ccr_u);
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_2,
+							  pwm_ccr_v);
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_3,
+							  pwm_ccr_w);
     }
 }
 
