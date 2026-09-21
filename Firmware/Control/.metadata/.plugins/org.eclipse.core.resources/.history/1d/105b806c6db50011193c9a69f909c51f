@@ -335,33 +335,13 @@ static void FOC_StateManager(void)
         {
             if (foc_start_request)
             {
-                /*
-                 * Consume this start request.
-                 */
                 foc_start_request = 0;
 
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+                //FOC_PWM_Enable();
 
-                /*
-                 * Check whether the system
-                 * is really allowed to run.
-                 */
-                if (FOC_CanStart())
-                {
-                    FOC_ResetControl();
-
-                    FOC_SetNeutralPWM();
-
-
-                    /*
-                     * Real power PWM is NOT enabled yet.
-                     * Real rotor electrical angle
-                     * has not been established.
-                     */
-                    // FOC_PWM_Enable();
-
-
-                    foc_state = FOC_STATE_RUN;
-                }
+                foc_state = FOC_STATE_RUN;
             }
 
             break;

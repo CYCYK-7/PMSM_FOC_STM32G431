@@ -46,15 +46,6 @@ typedef enum
 
 } FOC_State_t;
 
-typedef enum
-{
-    FOC_FAULT_NONE = 0,
-
-    FOC_FAULT_VDC_UNDERVOLTAGE,  //欠压
-
-    FOC_FAULT_VDC_OVERVOLTAGE //过压
-
-} FOC_Fault_t;
 
 
 /* USER CODE END PTD */
@@ -96,9 +87,8 @@ UART_HandleTypeDef huart3;
 #define VDC_R_LOW            3.0f
 
 #define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频率
-#define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 
-#define VDC_FAULT_CONFIRM_SAMPLES  100 // 100*50us = 50ms
+#define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 
  //Private Variables
 // uint32_t counter = 0;  //计数变量
@@ -172,17 +162,10 @@ volatile uint16_t vdc_adc_raw = 0;
 volatile float vdc_bus = 0.0f;
 
 volatile FOC_State_t foc_state = FOC_STATE_INIT;
+
 volatile uint8_t foc_start_request = 0;
 volatile uint8_t foc_stop_request  = 0;
 volatile uint8_t foc_fault_request = 0;
-volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
-volatile uint8_t foc_fault_reset_request = 0;
-
-volatile float vdc_uv_trip = 0.5f; // test value
-volatile float vdc_ov_trip = 5.0f;
-
-volatile uint16_t vdc_uv_counter = 0;
-volatile uint16_t vdc_ov_counter = 0;
 
 /* USER CODE END PV */
 
@@ -206,13 +189,6 @@ static uint32_t DutyToCCR(float duty);
 static void FOC_ResetControl(void);
 static void FOC_SetNeutralPWM(void);
 static void FOC_StateManager(void);
-static void FOC_PWM_Enable(void);
-static void FOC_PWM_Disable(void); //只关闭三相
-static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
-static void FOC_TriggerFault(FOC_Fault_t fault_code);
-static void FOC_CheckVdcProtection(void);
-
-static uint8_t FOC_CanStart(void);
 
 
 
@@ -304,8 +280,6 @@ static void FOC_StateManager(void)
     {
         foc_fault_request = 0;
 
-        FOC_PWM_EmergencyDisable();
-
         FOC_ResetControl();
         FOC_SetNeutralPWM();
 
@@ -335,33 +309,11 @@ static void FOC_StateManager(void)
         {
             if (foc_start_request)
             {
-                /*
-                 * Consume this start request.
-                 */
                 foc_start_request = 0;
 
+                FOC_ResetControl();
 
-                /*
-                 * Check whether the system
-                 * is really allowed to run.
-                 */
-                if (FOC_CanStart())
-                {
-                    FOC_ResetControl();
-
-                    FOC_SetNeutralPWM();
-
-
-                    /*
-                     * Real power PWM is NOT enabled yet.
-                     * Real rotor electrical angle
-                     * has not been established.
-                     */
-                    // FOC_PWM_Enable();
-
-
-                    foc_state = FOC_STATE_RUN;
-                }
+                foc_state = FOC_STATE_RUN;
             }
 
             break;
@@ -370,12 +322,9 @@ static void FOC_StateManager(void)
 
         case FOC_STATE_RUN:
         {
-            if (foc_stop_request) //如果要求停止那下面的pwm自然就是disable
+            if (foc_stop_request)
             {
                 foc_stop_request = 0;
-
-                /* First stop power output */
-                FOC_PWM_Disable();
 
                 FOC_ResetControl();
                 FOC_SetNeutralPWM();
@@ -389,68 +338,8 @@ static void FOC_StateManager(void)
 
         case FOC_STATE_FAULT:
         {
-            /*
-             * Keep outputs disabled while fault is latched.
-             */
-            FOC_PWM_EmergencyDisable();
-
             FOC_ResetControl();
             FOC_SetNeutralPWM();
-
-
-            /*
-             * Explicit fault reset is required.
-             */
-            if (foc_fault_reset_request)
-            {
-                foc_fault_reset_request = 0;
-
-
-                /*
-                 * Reset current offset calibration.
-                 */
-                current_offset_done  = 0;
-                current_offset_count = 0;
-
-                iu_offset_sum = 0;
-                iv_offset_sum = 0;
-
-
-                /*
-                 * Reset controller.
-                 */
-                FOC_ResetControl();
-                FOC_SetNeutralPWM();
-
-
-                /*
-                 * Disable phase outputs first.
-                 * CH4 remains enabled.
-                 */
-                FOC_PWM_Disable();
-
-
-                /*
-                 * MOE was cleared by EmergencyDisable.
-                 * Re-enable MOE so CH4 can trigger ADC again.
-                 *
-                 * CH1~CH3 are still disabled in CCER,
-                 * therefore phase power outputs remain OFF.
-                 */
-                __HAL_TIM_MOE_ENABLE(&htim1);
-
-
-                /*
-                 * Clear latched fault information.
-                 */
-                foc_fault_code = FOC_FAULT_NONE;
-
-
-                /*
-                 * Re-calibrate current offset before READY.
-                 */
-                foc_state = FOC_STATE_CALIBRATION;
-            }
 
             break;
         }
@@ -467,162 +356,6 @@ static void FOC_StateManager(void)
         }
     }
 }
-
-static void FOC_PWM_Enable(void)
-{
-    __HAL_TIM_MOE_ENABLE(&htim1);
-    SET_BIT(TIM1->CCER,
-            TIM_CCER_CC1E  |
-            TIM_CCER_CC1NE |
-            TIM_CCER_CC2E  |
-            TIM_CCER_CC2NE |
-            TIM_CCER_CC3E  |
-            TIM_CCER_CC3NE);
-}
-
-static void FOC_PWM_Disable(void)
-{
-    CLEAR_BIT(TIM1->CCER,
-              TIM_CCER_CC1E  |
-              TIM_CCER_CC1NE |
-              TIM_CCER_CC2E  |
-              TIM_CCER_CC2NE |
-              TIM_CCER_CC3E  |
-              TIM_CCER_CC3NE);
-}
-
-static void FOC_TriggerFault(FOC_Fault_t fault_code)
-{
-    /*
-     * Only latch the first fault.
-     */
-    if ((foc_state != FOC_STATE_FAULT) &&
-        (foc_fault_request == 0))
-    {
-        foc_fault_code = fault_code;
-
-        /*
-         * Immediately stop inverter output.
-         */
-        FOC_PWM_EmergencyDisable();
-
-        /*
-         * Ask state manager to enter FAULT.
-         */
-        foc_fault_request = 1;
-    }
-}
-
-static void FOC_PWM_EmergencyDisable(void)
-{
-    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
-}
-
-static void FOC_CheckVdcProtection(void)
-{
-    /* ==========================================
-     * Over-voltage protection
-     * READY 和 RUN 都可以检测过压
-     * ========================================== */
-    if ((foc_state == FOC_STATE_READY) ||
-        (foc_state == FOC_STATE_RUN))
-    {
-        if (vdc_bus > vdc_ov_trip)
-        {
-            if (vdc_ov_counter < VDC_FAULT_CONFIRM_SAMPLES)
-            {
-                vdc_ov_counter++;
-            }
-
-            if (vdc_ov_counter >= VDC_FAULT_CONFIRM_SAMPLES)
-            {
-                FOC_TriggerFault(
-                    FOC_FAULT_VDC_OVERVOLTAGE);
-            }
-        }
-        else
-        {
-            vdc_ov_counter = 0;
-        }
-    }
-    else
-    {
-        vdc_ov_counter = 0;
-    }
-
-
-    /* ==========================================
-     * Under-voltage protection
-     * 当前只在 RUN 中检测
-     * ========================================== */
-    if (foc_state == FOC_STATE_RUN)
-    {
-        if (vdc_bus < vdc_uv_trip)
-        {
-            if (vdc_uv_counter < VDC_FAULT_CONFIRM_SAMPLES)
-            {
-                vdc_uv_counter++;
-            }
-
-            if (vdc_uv_counter >= VDC_FAULT_CONFIRM_SAMPLES)
-            {
-                FOC_TriggerFault(
-                    FOC_FAULT_VDC_UNDERVOLTAGE);
-            }
-        }
-        else
-        {
-            vdc_uv_counter = 0;
-        }
-    }
-    else
-    {
-        vdc_uv_counter = 0;
-    }
-}
-
-static uint8_t FOC_CanStart(void)
-{
-    /*
-     * 1. Current offset calibration must be finished.
-     */
-    if (current_offset_done == 0)
-    {
-        return 0;
-    }
-
-
-    /*
-     * 2. There must be no active fault.
-     */
-    if ((foc_fault_request != 0) ||  //have fault return 0
-        (foc_fault_code != FOC_FAULT_NONE))
-    {
-        return 0;
-    }
-
-
-    /*
-     * 3. DC bus voltage must be inside
-     *    the allowed operating range.
-     */
-    if (vdc_bus <= vdc_uv_trip)
-    {
-        return 0;
-    }
-
-    if (vdc_bus >= vdc_ov_trip)
-    {
-        return 0;
-    }
-
-
-    /*
-     * All current start conditions are satisfied.
-     */
-    return 1;
-}
-
 
 /* USER CODE END 0 */
 
@@ -716,12 +449,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
 
-
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-
-  /* Keep timer running, but disable power outputs */
-  FOC_PWM_Disable();
-
   HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);// Truly activate the PWM output of TIM4 Channel 1. INIT only be used to configure TIM4
   //__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2125);  // used to modify CCR
@@ -1346,17 +1074,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
         current_sample_ready = 0;
 
-		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY 和 FAULT 状态需要知道 Vdc
-
         adc_injected_count++;
-
-        /* DC bus protection */
-        FOC_CheckVdcProtection();
-
-        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while（1）中的FOC_StateManager();执行之后
-        {
-            return;
-        }
 
         /* ---------- Offset calibration ---------- */
         if (foc_state == FOC_STATE_CALIBRATION)
@@ -1378,8 +1096,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
                 FOC_ResetControl();
                 FOC_SetNeutralPWM();
-
-                FOC_PWM_Disable();
 
                 foc_state = FOC_STATE_READY;//after calibration state manager into ready
             }
@@ -1482,6 +1198,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 				   i_dq.q,
 				   CURRENT_LOOP_TS);
 
+		vdc_bus =
+			(float)vdc_adc_raw
+			* VDC_VOLTS_PER_COUNT;
 
 
 		/* Inverse Park */

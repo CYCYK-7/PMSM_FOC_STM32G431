@@ -212,8 +212,6 @@ static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
 static void FOC_TriggerFault(FOC_Fault_t fault_code);
 static void FOC_CheckVdcProtection(void);
 
-static uint8_t FOC_CanStart(void);
-
 
 
 /* USER CODE END PFP */
@@ -335,33 +333,13 @@ static void FOC_StateManager(void)
         {
             if (foc_start_request)
             {
-                /*
-                 * Consume this start request.
-                 */
                 foc_start_request = 0;
 
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+                //FOC_PWM_Enable();
 
-                /*
-                 * Check whether the system
-                 * is really allowed to run.
-                 */
-                if (FOC_CanStart())
-                {
-                    FOC_ResetControl();
-
-                    FOC_SetNeutralPWM();
-
-
-                    /*
-                     * Real power PWM is NOT enabled yet.
-                     * Real rotor electrical angle
-                     * has not been established.
-                     */
-                    // FOC_PWM_Enable();
-
-
-                    foc_state = FOC_STATE_RUN;
-                }
+                foc_state = FOC_STATE_RUN;
             }
 
             break;
@@ -580,49 +558,6 @@ static void FOC_CheckVdcProtection(void)
         vdc_uv_counter = 0;
     }
 }
-
-static uint8_t FOC_CanStart(void)
-{
-    /*
-     * 1. Current offset calibration must be finished.
-     */
-    if (current_offset_done == 0)
-    {
-        return 0;
-    }
-
-
-    /*
-     * 2. There must be no active fault.
-     */
-    if ((foc_fault_request != 0) ||  //have fault return 0
-        (foc_fault_code != FOC_FAULT_NONE))
-    {
-        return 0;
-    }
-
-
-    /*
-     * 3. DC bus voltage must be inside
-     *    the allowed operating range.
-     */
-    if (vdc_bus <= vdc_uv_trip)
-    {
-        return 0;
-    }
-
-    if (vdc_bus >= vdc_ov_trip)
-    {
-        return 0;
-    }
-
-
-    /*
-     * All current start conditions are satisfied.
-     */
-    return 1;
-}
-
 
 /* USER CODE END 0 */
 
