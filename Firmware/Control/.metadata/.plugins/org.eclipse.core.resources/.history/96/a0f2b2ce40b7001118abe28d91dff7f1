@@ -943,7 +943,7 @@ int main(void)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      uint32_t edge; //边沿次数 之前为了算电机极对数使用的
+	      uint32_t edge;
 
 	      hall_uart_pending = 0;
 
@@ -972,16 +972,15 @@ int main(void)
 	      int len =
 	          snprintf(tx_buffer,
 	                   sizeof(tx_buffer),
-	                   "HALL:%u%u%u State=%u Sector=%d Dir=%s Capture=%lu us RPM=%.1f We=%.2f\r\n",
+	                   "HALL:%u%u%u State=%u Sector=%d Dir=%s Edge=%lu Capture=%lu us\r\n",
 	                   (state >> 2) & 0x01,
 	                   (state >> 1) & 0x01,
 	                   state & 0x01,
 	                   (unsigned int)state,
 	                   (int)hall_sector,
 	                   dir_str,
-	                   (unsigned long)capture,
-	                   hall_speed_rpm,
-	                   hall_omega_e);
+	                   (unsigned long)edge,
+	                   (unsigned long)capture);
 
 
 	      HAL_UART_Transmit(&huart3,
@@ -1764,7 +1763,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
         Hall_UpdateDirection(hall_sector);
 
-        Hall_UpdateSpeed(hall_capture);
 
         /* Save one Hall event for UART */
         hall_report_state =

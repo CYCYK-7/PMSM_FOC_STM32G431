@@ -943,7 +943,7 @@ int main(void)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      uint32_t edge; //边沿次数 之前为了算电机极对数使用的
+	      uint32_t edge;
 
 	      hall_uart_pending = 0;
 

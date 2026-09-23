@@ -56,13 +56,6 @@ typedef enum
 
 } FOC_Fault_t;
 
-typedef enum
-{
-    HALL_DIR_UNKNOWN = 0,
-    HALL_DIR_CW      = 1,
-    HALL_DIR_CCW     = -1
-
-} Hall_Direction_t;
 
 /* USER CODE END PTD */
 
@@ -106,10 +99,6 @@ UART_HandleTypeDef huart3;
 #define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 
 #define VDC_FAULT_CONFIRM_SAMPLES  100 // 100*50us = 50ms
-
-#define MOTOR_POLE_PAIRS       2.0f
-#define HALL_TIMER_TICK_S      0.000001f
-#define PI_F                   3.141592654f
 
  //Private Variables
 // uint32_t counter = 0;  //计数变量
@@ -204,28 +193,7 @@ volatile uint8_t hall_state = 0;
 
 volatile uint32_t hall_edge_count = 0;
 volatile uint32_t hall_capture = 0;
-
-//hall uart value begin
-volatile uint8_t hall_uart_pending = 0;
-volatile uint8_t hall_report_state = 0;
-volatile uint32_t hall_report_capture = 0;
-volatile uint32_t hall_report_edge_count = 0;
-//hall uart value end
-
-// direction
-volatile int8_t hall_sector = -1;
-volatile int8_t hall_prev_sector = -1;
-volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
-
-// speed
-volatile float hall_speed_rpm = 0.0f;
-volatile float hall_omega_e = 0.0f;
-volatile float hall_omega_m = 0.0f;
-
-
 //-----------HALL-------------------
-
-
 
 /* USER CODE END PV */
 
@@ -257,9 +225,6 @@ static uint8_t FOC_CanStart(void);
 
 
 static void Hall_UpdateState(void);
-static int8_t Hall_StateToSector(uint8_t state);
-static void Hall_UpdateDirection(int8_t new_sector);
-static void Hall_UpdateSpeed(uint32_t capture);
 
 /* USER CODE END PFP */
 
@@ -304,7 +269,7 @@ static uint32_t DutyToCCR(float duty)
     return ccr;
 }
 
-// -----------------------state manager begin------------------------
+// -----------------------state manager------------------------
 static void FOC_ResetControl(void)
 {
     PI_Reset(&pi_id);
@@ -667,9 +632,9 @@ static uint8_t FOC_CanStart(void)
      */
     return 1;
 }
-// -----------------------state manager end------------------------
+// -----------------------state manager------------------------
 
-// -----------------HALL begin----------------------
+// -----------------HALL----------------------
 static void Hall_UpdateState(void)
 {
     hall_a =
@@ -688,128 +653,7 @@ static void Hall_UpdateState(void)
          hall_c;
 }
 
-static int8_t Hall_StateToSector(uint8_t state)
-{
-    switch (state)
-    {
-        case 1:  return 0;   // 001
-        case 3:  return 1;   // 011
-        case 2:  return 2;   // 010
-        case 6:  return 3;   // 110
-        case 4:  return 4;   // 100
-        case 5:  return 5;   // 101
 
-        default:
-        	return -1;  // 000 / 111 invalid
-    }
-}
-
-static void Hall_UpdateDirection(int8_t new_sector)
-{
-    /* Invalid Hall state */
-    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个值初始定义为-1，这说明当没转的时候还不知道方向
-    	                   // 但是在中断中hall_sector = Hall_StateToSector(hall_state);
-    {
-        hall_direction = HALL_DIR_UNKNOWN;
-        return;
-    }
-
-
-    /* First valid Hall state */
-    if (hall_prev_sector < 0)  // 当刚开机没转时候，程序等于没存前一次的sector的值，所以到定义，为什么定义为-1呢，
-    	                       // 这是因为，为了方便将第一次采集到的值幅值给hall_prev_sector
-    {
-        hall_prev_sector = new_sector;
-        return;
-    }
-
-
-    /* Clockwise */
-    if (new_sector ==
-        ((hall_prev_sector + 1) % 6))
-    {
-        hall_direction = HALL_DIR_CW;
-    }
-
-    /* Counter-clockwise */
-    else if (new_sector ==
-             ((hall_prev_sector + 5) % 6))
-    {
-        hall_direction = HALL_DIR_CCW;
-    }
-
-    /* Illegal jump */
-    else if (new_sector != hall_prev_sector)  //use record illegal jump
-    {
-        hall_direction = HALL_DIR_UNKNOWN;
-    }
-
-
-    hall_prev_sector = new_sector;
-}
-
-static void Hall_UpdateSpeed(uint32_t capture)
-{
-    float delta_t;
-    float direction_sign;
-
-
-    /* Avoid division by zero */
-    if (capture == 0U)
-    {
-        return;
-    }
-
-
-    /* Direction not yet known */
-    if (hall_direction == HALL_DIR_UNKNOWN)
-    {
-        return;
-    }
-
-
-    /*
-     * TIM4:
-     * 1 count = 1 us
-     */
-    delta_t = (float)capture * HALL_TIMER_TICK_S;
-
-
-    /* Direction sign */
-    direction_sign = (hall_direction == HALL_DIR_CW) ? 1.0f : -1.0f;
-
-
-    /*
-     * Electrical angular speed:
-     *
-     * each Hall transition = 60 electrical degrees
-     *                      = pi / 3 rad
-     */
-    hall_omega_e =
-        direction_sign
-        * (PI_F / 3.0f)
-        / delta_t;
-
-
-    /*
-     * Mechanical angular speed
-     *
-     * omega_e = p * omega_m
-     */
-    hall_omega_m =
-        hall_omega_e
-        / MOTOR_POLE_PAIRS;
-
-
-    /*
-     * Mechanical RPM
-     */
-    hall_speed_rpm =
-        hall_omega_m
-        * 60.0f
-        / (2.0f * PI_F);
-}
-// -----------------HALL end----------------------
 
 /* USER CODE END 0 */
 
@@ -914,11 +758,8 @@ int main(void)
   {
       Error_Handler();
   }
-
-  /* Read initial Hall state */
   Hall_UpdateState();
-  hall_sector =
-      Hall_StateToSector(hall_state);
+
 
 
 
@@ -938,51 +779,16 @@ int main(void)
 
 	  FOC_StateManager();//状tai机
 
-
-	  if (hall_uart_pending)
+	  if (uart_send_flag)
 	  {
-	      uint8_t state;
-	      uint32_t capture;
-	      uint32_t edge; //边沿次数 之前为了算电机极对数使用的
+	      uart_send_flag = 0;
 
-	      hall_uart_pending = 0;
-
-
-	      state = hall_report_state;
-
-	      capture = hall_report_capture;
-
-	      edge = hall_report_edge_count;
-
-	      const char *dir_str;
-
-	      if (hall_direction == HALL_DIR_CW)
-	      {
-	          dir_str = "CW";
-	      }
-	      else if (hall_direction == HALL_DIR_CCW)
-	      {
-	          dir_str = "CCW";
-	      }
-	      else
-	      {
-	          dir_str = "UNKNOWN";
-	      }
-
-	      int len =
-	          snprintf(tx_buffer,
-	                   sizeof(tx_buffer),
-	                   "HALL:%u%u%u State=%u Sector=%d Dir=%s Capture=%lu us RPM=%.1f We=%.2f\r\n",
-	                   (state >> 2) & 0x01,
-	                   (state >> 1) & 0x01,
-	                   state & 0x01,
-	                   (unsigned int)state,
-	                   (int)hall_sector,
-	                   dir_str,
-	                   (unsigned long)capture,
-	                   hall_speed_rpm,
-	                   hall_omega_e);
-
+	      int len = snprintf(tx_buffer,
+	                         sizeof(tx_buffer),
+	                         "Theta=%.3f | Id=%.3f Iq=%.3f\r\n",
+	                         theta_e_test,
+	                         i_dq.d,
+	                         i_dq.q);
 
 	      HAL_UART_Transmit(&huart3,
 	                        (uint8_t *)tx_buffer,
@@ -1543,6 +1349,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 
+
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
@@ -1746,41 +1553,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 							  pwm_ccr_w);
     }
 }
-
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM4)
-    {
-        hall_capture =
-            HAL_TIM_ReadCapturedValue(htim,
-                                      TIM_CHANNEL_1);
-
-        hall_edge_count++;
-
-
-        /* Read HA / HB / HC */
-        Hall_UpdateState();
-        hall_sector = Hall_StateToSector(hall_state);
-
-        Hall_UpdateDirection(hall_sector);
-
-        Hall_UpdateSpeed(hall_capture);
-
-        /* Save one Hall event for UART */
-        hall_report_state =
-            hall_state;
-
-        hall_report_capture =
-            hall_capture;
-
-        hall_report_edge_count =
-            hall_edge_count;
-
-
-        hall_uart_pending = 1;
-    }
-}
-
 
 /* USER CODE END 4 */
 

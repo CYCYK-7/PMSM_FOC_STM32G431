@@ -107,10 +107,6 @@ UART_HandleTypeDef huart3;
 
 #define VDC_FAULT_CONFIRM_SAMPLES  100 // 100*50us = 50ms
 
-#define MOTOR_POLE_PAIRS       2.0f
-#define HALL_TIMER_TICK_S      0.000001f
-#define PI_F                   3.141592654f
-
  //Private Variables
 // uint32_t counter = 0;  //计数变量
 
@@ -205,23 +201,16 @@ volatile uint8_t hall_state = 0;
 volatile uint32_t hall_edge_count = 0;
 volatile uint32_t hall_capture = 0;
 
-//hall uart value begin
+//hall uart value
 volatile uint8_t hall_uart_pending = 0;
 volatile uint8_t hall_report_state = 0;
 volatile uint32_t hall_report_capture = 0;
 volatile uint32_t hall_report_edge_count = 0;
-//hall uart value end
 
-// direction
 volatile int8_t hall_sector = -1;
 volatile int8_t hall_prev_sector = -1;
+
 volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
-
-// speed
-volatile float hall_speed_rpm = 0.0f;
-volatile float hall_omega_e = 0.0f;
-volatile float hall_omega_m = 0.0f;
-
 
 //-----------HALL-------------------
 
@@ -259,7 +248,6 @@ static uint8_t FOC_CanStart(void);
 static void Hall_UpdateState(void);
 static int8_t Hall_StateToSector(uint8_t state);
 static void Hall_UpdateDirection(int8_t new_sector);
-static void Hall_UpdateSpeed(uint32_t capture);
 
 /* USER CODE END PFP */
 
@@ -304,7 +292,7 @@ static uint32_t DutyToCCR(float duty)
     return ccr;
 }
 
-// -----------------------state manager begin------------------------
+// -----------------------state manager------------------------
 static void FOC_ResetControl(void)
 {
     PI_Reset(&pi_id);
@@ -667,9 +655,9 @@ static uint8_t FOC_CanStart(void)
      */
     return 1;
 }
-// -----------------------state manager end------------------------
+// -----------------------state manager------------------------
 
-// -----------------HALL begin----------------------
+// -----------------HALL----------------------
 static void Hall_UpdateState(void)
 {
     hall_a =
@@ -747,69 +735,6 @@ static void Hall_UpdateDirection(int8_t new_sector)
 
     hall_prev_sector = new_sector;
 }
-
-static void Hall_UpdateSpeed(uint32_t capture)
-{
-    float delta_t;
-    float direction_sign;
-
-
-    /* Avoid division by zero */
-    if (capture == 0U)
-    {
-        return;
-    }
-
-
-    /* Direction not yet known */
-    if (hall_direction == HALL_DIR_UNKNOWN)
-    {
-        return;
-    }
-
-
-    /*
-     * TIM4:
-     * 1 count = 1 us
-     */
-    delta_t = (float)capture * HALL_TIMER_TICK_S;
-
-
-    /* Direction sign */
-    direction_sign = (hall_direction == HALL_DIR_CW) ? 1.0f : -1.0f;
-
-
-    /*
-     * Electrical angular speed:
-     *
-     * each Hall transition = 60 electrical degrees
-     *                      = pi / 3 rad
-     */
-    hall_omega_e =
-        direction_sign
-        * (PI_F / 3.0f)
-        / delta_t;
-
-
-    /*
-     * Mechanical angular speed
-     *
-     * omega_e = p * omega_m
-     */
-    hall_omega_m =
-        hall_omega_e
-        / MOTOR_POLE_PAIRS;
-
-
-    /*
-     * Mechanical RPM
-     */
-    hall_speed_rpm =
-        hall_omega_m
-        * 60.0f
-        / (2.0f * PI_F);
-}
-// -----------------HALL end----------------------
 
 /* USER CODE END 0 */
 
@@ -943,7 +868,7 @@ int main(void)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      uint32_t edge; //边沿次数 之前为了算电机极对数使用的
+	      uint32_t edge;
 
 	      hall_uart_pending = 0;
 
@@ -972,16 +897,15 @@ int main(void)
 	      int len =
 	          snprintf(tx_buffer,
 	                   sizeof(tx_buffer),
-	                   "HALL:%u%u%u State=%u Sector=%d Dir=%s Capture=%lu us RPM=%.1f We=%.2f\r\n",
+	                   "HALL:%u%u%u State=%u Sector=%d Dir=%s Edge=%lu Capture=%lu us\r\n",
 	                   (state >> 2) & 0x01,
 	                   (state >> 1) & 0x01,
 	                   state & 0x01,
 	                   (unsigned int)state,
 	                   (int)hall_sector,
 	                   dir_str,
-	                   (unsigned long)capture,
-	                   hall_speed_rpm,
-	                   hall_omega_e);
+	                   (unsigned long)edge,
+	                   (unsigned long)capture);
 
 
 	      HAL_UART_Transmit(&huart3,
@@ -1764,7 +1688,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
         Hall_UpdateDirection(hall_sector);
 
-        Hall_UpdateSpeed(hall_capture);
 
         /* Save one Hall event for UART */
         hall_report_state =
