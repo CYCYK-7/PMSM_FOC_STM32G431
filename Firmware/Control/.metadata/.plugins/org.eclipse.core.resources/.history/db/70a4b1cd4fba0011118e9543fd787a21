@@ -194,8 +194,8 @@ volatile uint8_t foc_fault_request = 0;
 volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
 volatile uint8_t foc_fault_reset_request = 0;
 
-volatile float vdc_uv_trip = 15.0f; // test value
-volatile float vdc_ov_trip = 30.0f;
+volatile float vdc_uv_trip = 0.5f; // test value
+volatile float vdc_ov_trip = 5.0f;
 
 volatile uint16_t vdc_uv_counter = 0;
 volatile uint16_t vdc_ov_counter = 0;

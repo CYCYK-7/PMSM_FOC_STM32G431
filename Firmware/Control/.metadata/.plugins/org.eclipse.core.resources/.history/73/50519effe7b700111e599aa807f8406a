@@ -111,10 +111,6 @@ UART_HandleTypeDef huart3;
 #define HALL_TIMER_TICK_S      0.00001f // arr 65535 psc 1699 10us
 #define PI_F                   3.141592654f
 #define HALL_STOP_TIMEOUT_MS 500U   // max time is 65536*10us = 655.36ms
-#define HALL_SECTOR_ANGLE_RAD   (PI_F / 3.0f)
-#define TWO_PI_F                (2.0f * PI_F)
-
-
 
  //Private Variables
 // uint32_t counter = 0;  //计数变量
@@ -194,8 +190,8 @@ volatile uint8_t foc_fault_request = 0;
 volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
 volatile uint8_t foc_fault_reset_request = 0;
 
-volatile float vdc_uv_trip = 15.0f; // test value
-volatile float vdc_ov_trip = 30.0f;
+volatile float vdc_uv_trip = 0.5f; // test value
+volatile float vdc_ov_trip = 5.0f;
 
 volatile uint16_t vdc_uv_counter = 0;
 volatile uint16_t vdc_ov_counter = 0;
@@ -229,15 +225,9 @@ volatile float hall_omega_m = 0.0f;
 volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可信
 volatile uint32_t hall_last_edge_ms = 0;
 
-//theta
-volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度，0~2π
-volatile uint8_t hall_angle_valid = 0;
-
-volatile uint32_t hall_angle_update_count = 0;
-
 //-----------HALL-------------------
 
-volatile uint32_t adc_callback_test_count = 0;
+
 
 /* USER CODE END PV */
 
@@ -273,9 +263,7 @@ static int8_t Hall_StateToSector(uint8_t state);
 static void Hall_UpdateDirection(int8_t new_sector);
 static void Hall_UpdateSpeed(uint32_t capture);
 static void Hall_CheckTimeout(void);
-static float WrapAngle0To2Pi(float angle);
-static void Hall_UpdateElectricalAngle(void);
-static void Hall_UpdateElectricalAngle(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -871,148 +859,6 @@ static void Hall_CheckTimeout(void)
     }
 }
 
-static float WrapAngle0To2Pi(float angle)  //角度归一化
-{
-    while (angle >= TWO_PI_F)
-    {
-        angle -= TWO_PI_F;
-    }
-
-    while (angle < 0.0f)
-    {
-        angle += TWO_PI_F;
-    }
-
-    return angle;
-}
-
-static void Hall_UpdateElectricalAngle(void)
-{
-	hall_angle_update_count++;
-
-	int8_t sector;
-    Hall_Direction_t direction;
-
-    uint32_t elapsed_count;
-
-    float elapsed_time;
-    float base_angle;
-    float delta_angle;
-
-
-    sector = hall_sector;
-    direction = hall_direction;
-
-
-    /*
-     * Hall state must be valid.
-     */
-    if ((sector < 0) || (sector > 5))
-    {
-        hall_angle_valid = 0;
-        return;
-    }
-
-
-    /*
-     * If speed/direction is currently valid,
-     * interpolate inside the Hall sector.
-     */
-    if ((hall_speed_valid != 0) &&
-        (direction != HALL_DIR_UNKNOWN))
-    {
-        /*
-         * In STM32 Hall Sensor mode,
-         * TIM4 counter is reset at each Hall transition.
-         *
-         * Therefore CNT represents the elapsed time
-         * since the latest Hall edge.
-         */
-        elapsed_count =
-            __HAL_TIM_GET_COUNTER(&htim4);
-
-
-        elapsed_time =
-            (float)elapsed_count
-            * HALL_TIMER_TICK_S;
-
-
-        /*
-         * Select the boundary where this sector
-         * was entered.
-         */
-        if (direction == HALL_DIR_CW)
-        {
-            base_angle =
-                (float)sector
-                * HALL_SECTOR_ANGLE_RAD;
-        }
-        else
-        {
-            base_angle =
-                (float)(sector + 1)
-                * HALL_SECTOR_ANGLE_RAD;
-        }
-
-
-        /*
-         * Angle travelled since latest Hall edge.
-         */
-        delta_angle =
-            hall_omega_e
-            * elapsed_time;
-
-
-        /*
-         * Limit interpolation to one Hall sector.
-         * Prevents angle running away if the rotor
-         * slows before the next Hall edge.
-         */
-        if (delta_angle > HALL_SECTOR_ANGLE_RAD)
-        {
-            delta_angle =
-                HALL_SECTOR_ANGLE_RAD;
-        }
-
-        if (delta_angle < -HALL_SECTOR_ANGLE_RAD)
-        {
-            delta_angle =
-                -HALL_SECTOR_ANGLE_RAD;
-        }
-
-
-        hall_theta_rel =
-            WrapAngle0To2Pi(
-                base_angle + delta_angle);
-
-
-        hall_angle_valid = 1;
-    }
-    else
-    {
-        /*
-         * Rotor stopped / speed invalid:
-         *
-         * Hall can still tell which 60° sector
-         * the rotor is inside, but not the exact
-         * position inside that sector.
-         *
-         * Use sector center as coarse position.
-         */
-        hall_theta_rel =
-            ((float)sector + 0.5f)
-            * HALL_SECTOR_ANGLE_RAD;
-
-
-        hall_theta_rel =
-            WrapAngle0To2Pi(
-                hall_theta_rel);
-
-
-        hall_angle_valid = 1;
-    }
-}
-
 // -----------------HALL end----------------------
 
 /* USER CODE END 0 */
@@ -1158,7 +1004,7 @@ int main(void)
 
 	      capture = hall_report_capture;
 
-	      //edge = hall_report_edge_count;
+	      edge = hall_report_edge_count;
 
 	      float hall_dt_ms =
 	          (float)capture
@@ -1180,7 +1026,7 @@ int main(void)
 	          dir_str = "UNKNOWN";
 	      }
 
-	      /* int len =
+	      int len =
 	          snprintf(tx_buffer,
 	                   sizeof(tx_buffer),
 	                   "HALL:%u%u%u Sector=%d Dir=%s dt=%.2fms RPM=%.1f We=%.2f Valid=%u\r\n",
@@ -1192,16 +1038,7 @@ int main(void)
 	                   hall_dt_ms,
 	                   hall_speed_rpm,
 	                   hall_omega_e,
-	                   hall_speed_valid);*/
-	      int len =
-	          snprintf(tx_buffer,
-	                   sizeof(tx_buffer),
-	                   "ThetaHall=%.3f Sector=%d RPM=%.1f We=%.2f Valid=%u\r\n",
-	                   hall_theta_rel,
-	                   (int)hall_sector,
-	                   hall_speed_rpm,
-	                   hall_omega_e,
-	                   hall_angle_valid);
+	                   hall_speed_valid);
 
 
 	      HAL_UART_Transmit(&huart3,
@@ -1765,7 +1602,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	adc_callback_test_count++;
     if (hadc->Instance == ADC1)
     {
         iu_raw_sync =
@@ -1882,15 +1718,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 			theta_e_test -= 6.283185307f;
 		}
 
-		/* Update real Hall interpolated angle */
-		/*
-		 * 不要只在 Hall 边沿中断里运行此函数
-		 *  因为如果只在 Hall ISR 里算：
-		 *  一个Hall边沿 → 算一次角度
-		 *  直到下一个Hall边沿 → 才再更新
-		 *  这仍然不是连续角度，所以放在20 kHz ADC 同步控制 ISR 中。
-		 */
-		Hall_UpdateElectricalAngle();
 
 		/* Park Transform */
 		Park_Run(i_ab.alpha,

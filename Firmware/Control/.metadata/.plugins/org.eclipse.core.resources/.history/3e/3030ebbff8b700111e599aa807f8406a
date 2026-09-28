@@ -194,8 +194,8 @@ volatile uint8_t foc_fault_request = 0;
 volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
 volatile uint8_t foc_fault_reset_request = 0;
 
-volatile float vdc_uv_trip = 15.0f; // test value
-volatile float vdc_ov_trip = 30.0f;
+volatile float vdc_uv_trip = 0.5f; // test value
+volatile float vdc_ov_trip = 5.0f;
 
 volatile uint16_t vdc_uv_counter = 0;
 volatile uint16_t vdc_ov_counter = 0;
@@ -237,7 +237,7 @@ volatile uint32_t hall_angle_update_count = 0;
 
 //-----------HALL-------------------
 
-volatile uint32_t adc_callback_test_count = 0;
+
 
 /* USER CODE END PV */
 
@@ -888,9 +888,7 @@ static float WrapAngle0To2Pi(float angle)  //角度归一化
 
 static void Hall_UpdateElectricalAngle(void)
 {
-	hall_angle_update_count++;
-
-	int8_t sector;
+    int8_t sector;
     Hall_Direction_t direction;
 
     uint32_t elapsed_count;
@@ -1013,6 +1011,12 @@ static void Hall_UpdateElectricalAngle(void)
     }
 }
 
+static void Hall_UpdateElectricalAngle(void)
+{
+    hall_angle_update_count++;
+
+    /* 原来的代码 */
+}
 // -----------------HALL end----------------------
 
 /* USER CODE END 0 */
@@ -1765,7 +1769,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	adc_callback_test_count++;
     if (hadc->Instance == ADC1)
     {
         iu_raw_sync =

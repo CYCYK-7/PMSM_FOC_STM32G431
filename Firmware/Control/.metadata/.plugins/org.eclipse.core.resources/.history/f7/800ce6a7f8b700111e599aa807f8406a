@@ -114,8 +114,6 @@ UART_HandleTypeDef huart3;
 #define HALL_SECTOR_ANGLE_RAD   (PI_F / 3.0f)
 #define TWO_PI_F                (2.0f * PI_F)
 
-
-
  //Private Variables
 // uint32_t counter = 0;  //计数变量
 
@@ -194,8 +192,8 @@ volatile uint8_t foc_fault_request = 0;
 volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
 volatile uint8_t foc_fault_reset_request = 0;
 
-volatile float vdc_uv_trip = 15.0f; // test value
-volatile float vdc_ov_trip = 30.0f;
+volatile float vdc_uv_trip = 0.5f; // test value
+volatile float vdc_ov_trip = 5.0f;
 
 volatile uint16_t vdc_uv_counter = 0;
 volatile uint16_t vdc_ov_counter = 0;
@@ -233,11 +231,9 @@ volatile uint32_t hall_last_edge_ms = 0;
 volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度，0~2π
 volatile uint8_t hall_angle_valid = 0;
 
-volatile uint32_t hall_angle_update_count = 0;
-
 //-----------HALL-------------------
 
-volatile uint32_t adc_callback_test_count = 0;
+
 
 /* USER CODE END PV */
 
@@ -275,7 +271,7 @@ static void Hall_UpdateSpeed(uint32_t capture);
 static void Hall_CheckTimeout(void);
 static float WrapAngle0To2Pi(float angle);
 static void Hall_UpdateElectricalAngle(void);
-static void Hall_UpdateElectricalAngle(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -888,9 +884,7 @@ static float WrapAngle0To2Pi(float angle)  //角度归一化
 
 static void Hall_UpdateElectricalAngle(void)
 {
-	hall_angle_update_count++;
-
-	int8_t sector;
+    int8_t sector;
     Hall_Direction_t direction;
 
     uint32_t elapsed_count;
@@ -1765,7 +1759,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	adc_callback_test_count++;
     if (hadc->Instance == ADC1)
     {
         iu_raw_sync =
