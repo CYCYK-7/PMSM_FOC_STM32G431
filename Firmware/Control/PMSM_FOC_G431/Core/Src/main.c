@@ -40,6 +40,8 @@ typedef enum
 
     FOC_STATE_READY,
 
+	FOC_STATE_ALIGN_TEST,  // 不通电对齐测试
+
     FOC_STATE_RUN,
 
     FOC_STATE_FAULT
@@ -52,7 +54,9 @@ typedef enum
 
     FOC_FAULT_VDC_UNDERVOLTAGE,  //欠压
 
-    FOC_FAULT_VDC_OVERVOLTAGE //过压
+    FOC_FAULT_VDC_OVERVOLTAGE, //过压
+
+	FOC_FAULT_OVERCURRENT
 
 } FOC_Fault_t;
 
@@ -104,6 +108,7 @@ UART_HandleTypeDef huart3;
 
 #define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�??
 #define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
+#define CURRENT_A_PER_COUNT  0.02198f
 
 #define VDC_FAULT_CONFIRM_SAMPLES  100 // 100*50us = 50ms
 
@@ -113,6 +118,11 @@ UART_HandleTypeDef huart3;
 #define HALL_STOP_TIMEOUT_MS 500U   // max time is 65536*10us = 655.36ms
 #define HALL_SECTOR_ANGLE_RAD   (PI_F / 3.0f)
 #define TWO_PI_F                (2.0f * PI_F)
+
+#define CURRENT_OC_TRIP_A            0.25f
+#define CURRENT_OC_CONFIRM_SAMPLES   2U
+
+volatile uint8_t current_oc_counter = 0;
 
 
 
@@ -154,6 +164,7 @@ volatile uint8_t current_sample_ready = 0;
 //-----------------------------------------------
 volatile float iu_a = 0.0f;
 volatile float iv_a = 0.0f;
+volatile float iw_a = 0.0f;
 
 AlphaBeta_t i_ab = {0};
 
@@ -239,6 +250,28 @@ volatile uint32_t hall_angle_update_count = 0;
 
 volatile uint32_t adc_callback_test_count = 0;
 
+
+//------------------ALIGN-------------------
+#define ALIGN_TEST_DURATION_MS  3000U
+#define ALIGN_TEST_V_ALPHA_V    0.5f
+
+volatile uint8_t foc_align_test_request = 0;
+volatile uint8_t foc_align_test_done = 0;
+
+volatile uint32_t align_test_start_ms = 0;
+volatile uint32_t align_test_elapsed_ms = 0;
+volatile uint32_t align_test_calc_count = 0;
+
+volatile float align_test_duty_u = 0.0f;
+volatile float align_test_duty_v = 0.0f;
+volatile float align_test_duty_w = 0.0f;
+
+volatile uint32_t align_test_ccr_u = 0;
+volatile uint32_t align_test_ccr_v = 0;
+volatile uint32_t align_test_ccr_w = 0;
+
+//---------------------ALIGN-------------------
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -276,6 +309,9 @@ static void Hall_CheckTimeout(void);
 static float WrapAngle0To2Pi(float angle);
 static void Hall_UpdateElectricalAngle(void);
 static void Hall_UpdateElectricalAngle(void);
+static void FOC_CheckOverCurrent(void);
+
+static void FOC_AlignTest_Calculate(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -359,7 +395,9 @@ static void FOC_SetNeutralPWM(void)
 
 static void FOC_StateManager(void)
 {
-    /* ---------- Global fault request ---------- */
+
+
+	/* ---------- Global fault request ---------- */
     if (foc_fault_request)
     {
         foc_fault_request = 0;
@@ -393,6 +431,30 @@ static void FOC_StateManager(void)
 
         case FOC_STATE_READY:
         {
+        	if (foc_align_test_request)
+        	{
+        	    foc_align_test_request = 0;
+
+        	    if (FOC_CanStart())
+        	    {
+        	        /* Power outputs must remain disabled */
+        	        FOC_PWM_Disable();
+
+        	        FOC_ResetControl();
+        	        FOC_SetNeutralPWM();
+
+        	        foc_align_test_done = 0;
+        	        align_test_calc_count = 0;
+        	        align_test_elapsed_ms = 0;
+
+        	        align_test_start_ms = HAL_GetTick();
+
+        	        foc_state = FOC_STATE_ALIGN_TEST;
+        	    }
+
+        	    break;
+        	}
+            /* ---------- Original normal start ---------- */
             if (foc_start_request)
             {
                 /*
@@ -422,6 +484,42 @@ static void FOC_StateManager(void)
 
                     foc_state = FOC_STATE_RUN;
                 }
+            }
+
+            break;
+        }
+
+        case FOC_STATE_ALIGN_TEST:
+        {
+            /* Never enable physical phase PWM */
+            FOC_PWM_Disable();
+
+            align_test_elapsed_ms =
+                (uint32_t)(
+                    HAL_GetTick() - align_test_start_ms
+                );
+
+            /* Allow manual cancellation */
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            /* Automatically finish after 3 seconds */
+            if (align_test_elapsed_ms >= ALIGN_TEST_DURATION_MS)
+            {
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+
+                foc_align_test_done = 1;
+
+                foc_state = FOC_STATE_READY;
             }
 
             break;
@@ -585,6 +683,7 @@ static void FOC_CheckVdcProtection(void)
      * READY �?? RUN 都可以检测过�??
      * ========================================== */
     if ((foc_state == FOC_STATE_READY) ||
+    	(foc_state == FOC_STATE_ALIGN_TEST) ||
         (foc_state == FOC_STATE_RUN))
     {
         if (vdc_bus > vdc_ov_trip)
@@ -615,7 +714,7 @@ static void FOC_CheckVdcProtection(void)
      * Under-voltage protection
      * 当前只在 RUN 中检�??
      * ========================================== */
-    if (foc_state == FOC_STATE_RUN)
+    if ((foc_state == FOC_STATE_ALIGN_TEST) ||foc_state == FOC_STATE_RUN)
     {
         if (vdc_bus < vdc_uv_trip)
         {
@@ -682,6 +781,42 @@ static uint8_t FOC_CanStart(void)
      */
     return 1;
 }
+
+static void FOC_CheckOverCurrent(void)
+{
+    uint8_t over_current = 0;
+
+    iw_a = -(iu_a + iv_a);
+
+    if ((iu_a > CURRENT_OC_TRIP_A) ||
+        (iu_a < -CURRENT_OC_TRIP_A) ||
+        (iv_a > CURRENT_OC_TRIP_A) ||
+        (iv_a < -CURRENT_OC_TRIP_A) ||
+        (iw_a > CURRENT_OC_TRIP_A) ||
+        (iw_a < -CURRENT_OC_TRIP_A))
+    {
+        over_current = 1;
+    }
+
+
+    if (over_current)
+    {
+        if (current_oc_counter < CURRENT_OC_CONFIRM_SAMPLES)
+        {
+            current_oc_counter++;
+        }
+
+        if (current_oc_counter >= CURRENT_OC_CONFIRM_SAMPLES)
+        {
+            FOC_TriggerFault(FOC_FAULT_OVERCURRENT);
+        }
+    }
+    else
+    {
+        current_oc_counter = 0;
+    }
+}
+
 // -----------------------state manager end------------------------
 
 // -----------------HALL begin----------------------
@@ -1014,6 +1149,41 @@ static void Hall_UpdateElectricalAngle(void)
 }
 
 // -----------------HALL end----------------------
+
+
+static void FOC_AlignTest_Calculate(void)
+{
+    float v_alpha = ALIGN_TEST_V_ALPHA_V;
+    float v_beta  = 0.0f;
+
+    SVPWM_Output_t result = {0};
+
+    /* Fixed alpha-axis voltage vector */
+    SVPWM_LimitVoltage(
+        &v_alpha,
+        &v_beta,
+        vdc_bus
+    );
+
+    SVPWM_Run(
+        v_alpha,
+        v_beta,
+        vdc_bus,
+        &result
+    );
+
+    /* Save calculated duty values */
+    align_test_duty_u = result.duty_u;
+    align_test_duty_v = result.duty_v;
+    align_test_duty_w = result.duty_w;
+
+    /* Calculate CCR values for observation */
+    align_test_ccr_u = DutyToCCR(result.duty_u);
+    align_test_ccr_v = DutyToCCR(result.duty_v);
+    align_test_ccr_w = DutyToCCR(result.duty_w);
+
+    align_test_calc_count++;
+}
 
 /* USER CODE END 0 */
 
@@ -1796,6 +1966,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         /* DC bus protection */
         FOC_CheckVdcProtection();
 
+
         if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�??1）中的FOC_StateManager();执行之后
         {
             return;
@@ -1849,25 +2020,32 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
          *    �??以继续计算实际电�??
          * ================================================== */
 
+        //standard FOC current direction e=i^*-i
 		iu_adc_delta =
-			(int32_t)iu_raw_sync - (int32_t)iu_offset_adc;
+		    (int32_t)iu_offset_adc
+		    - (int32_t)iu_raw_sync;
 
 		iv_adc_delta =
-			(int32_t)iv_raw_sync - (int32_t)iv_offset_adc;
+		    (int32_t)iv_offset_adc
+		    - (int32_t)iv_raw_sync;
 
-		/*
-		 * Current Board�??
-		 * Rsense = 5mΩ
-		 * OPAMP Gain �?? 7.33
-		 *
-		 * �?? 21.98 mA / ADC count
-		 */
-		iu_ma = iu_adc_delta * 2198L / 100L;
-		iv_ma = iv_adc_delta * 2198L / 100L;
+		iu_a =
+		    (float)iu_adc_delta
+		    * CURRENT_A_PER_COUNT;
 
-		/* mA -> A */
-		iu_a = (float)iu_ma * 0.001f;
-		iv_a = (float)iv_ma * 0.001f;
+		iv_a =
+		    (float)iv_adc_delta
+		    * CURRENT_A_PER_COUNT;
+
+		iu_ma = (int32_t)(iu_a * 1000.0f);
+		iv_ma = (int32_t)(iv_a * 1000.0f);
+
+		FOC_CheckOverCurrent();
+
+		if (foc_fault_request)
+		{
+		    return;
+		}
 
 		/* Clarke Transform */
 		Clarke_Run(iu_a,
@@ -1891,6 +2069,13 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		 *  这仍然不是连续角度，所以放在20 kHz ADC 同步控制 ISR 中。
 		 */
 		Hall_UpdateElectricalAngle();
+
+		/* Alignment software-only test */
+		if (foc_state == FOC_STATE_ALIGN_TEST)
+		{
+		    FOC_AlignTest_Calculate();
+		    return;
+		}
 
 		/* Park Transform */
 		Park_Run(i_ab.alpha,
