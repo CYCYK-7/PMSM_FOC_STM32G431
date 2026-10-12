@@ -40,7 +40,13 @@ typedef enum
 
     FOC_STATE_READY,
 
-	FOC_STATE_ALIGN_TEST,  // 不通电对齐测试
+	FOC_STATE_ALIGN_TEST,  // 不�?�电对齐测试
+
+	FOC_STATE_BOOTSTRAP_PREPARE,
+	FOC_STATE_BOOTSTRAP_CHARGE,
+
+    FOC_STATE_ALIGN_PREPARE,
+    FOC_STATE_ALIGN_ACTIVE,
 
     FOC_STATE_RUN,
 
@@ -56,7 +62,9 @@ typedef enum
 
     FOC_FAULT_VDC_OVERVOLTAGE, //过压
 
-	FOC_FAULT_OVERCURRENT
+	FOC_FAULT_OVERCURRENT,
+
+	FOC_FAULT_HALL_INVALID  // Hall电角度无�?
 
 } FOC_Fault_t;
 
@@ -106,7 +114,7 @@ UART_HandleTypeDef huart3;
 #define VDC_R_HIGH           75.0f
 #define VDC_R_LOW            3.0f
 
-#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�??
+#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�???
 #define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 #define CURRENT_A_PER_COUNT  0.02198f
 
@@ -121,6 +129,15 @@ UART_HandleTypeDef huart3;
 
 #define CURRENT_OC_TRIP_A            0.25f
 #define CURRENT_OC_CONFIRM_SAMPLES   2U
+
+#define BOOTSTRAP_PREPARE_MS  2U
+#define BOOTSTRAP_CHARGE_MS   10U
+
+/* Real alignment: disabled by default until power-stage safeguards are verified. */
+#define ALIGN_POWER_ALLOWED   1U
+#define ALIGN_PREPARE_MS      2U
+#define ALIGN_ACTIVE_MS       100U
+#define ALIGN_V_ALPHA_V       0.5f
 
 volatile uint8_t current_oc_counter = 0;
 
@@ -189,7 +206,7 @@ volatile uint32_t pwm_ccr_u = 0;
 volatile uint32_t pwm_ccr_v = 0;
 volatile uint32_t pwm_ccr_w = 0;
 
-float v_alpha_cmd = 0.0f; //�??终�?�给SVPWM的电�??
+float v_alpha_cmd = 0.0f; //�???终�?�给SVPWM的电�???
 float v_beta_cmd  = 0.0f;
 
 volatile uint8_t foc_enable = 0;//目前没有接入真正的角度，还没有真正的电机闭环
@@ -237,11 +254,11 @@ volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
 volatile float hall_speed_rpm = 0.0f;
 volatile float hall_omega_e = 0.0f;
 volatile float hall_omega_m = 0.0f;
-volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可信
+volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�?
 volatile uint32_t hall_last_edge_ms = 0;
 
 //theta
-volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度，0~2π
+volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�?0~2π
 volatile uint8_t hall_angle_valid = 0;
 
 volatile uint32_t hall_angle_update_count = 0;
@@ -270,7 +287,39 @@ volatile uint32_t align_test_ccr_u = 0;
 volatile uint32_t align_test_ccr_v = 0;
 volatile uint32_t align_test_ccr_w = 0;
 
+volatile float hall_offset_test_rad = PI_F / 3.0f;
+volatile float hall_theta_corrected_test = 0.0f;
+volatile float theta_e_foc = 0.0f;
+
+volatile uint32_t angle_uart_last_ms = 0;
 //---------------------ALIGN-------------------
+
+volatile uint8_t foc_bootstrap_request = 0;
+volatile uint8_t foc_bootstrap_done = 0;
+
+volatile uint32_t bootstrap_start_ms = 0;
+volatile uint32_t bootstrap_elapsed_ms = 0;
+
+volatile uint32_t bootstrap_ccer_snapshot = 0;
+
+volatile uint8_t foc_real_align_request = 0;
+volatile uint8_t foc_real_align_done = 0;
+volatile uint8_t align_after_bootstrap = 0;
+volatile uint32_t align_prepare_start_ms = 0;
+volatile uint32_t align_active_start_ms = 0;
+volatile int8_t align_final_sector = -1;
+volatile float align_max_abs_phase_current = 0.0f;
+
+/* SW3 button settings */
+#define SW3_DEBOUNCE_MS      30U
+#define SW3_LONG_PRESS_MS    500U
+
+/* Debug counters */
+volatile uint32_t sw3_long_press_count = 0;
+volatile uint32_t sw3_align_request_count = 0;
+
+volatile uint32_t align_pwm_ccer_snapshot = 0;
+volatile uint8_t align_pwm_moe_snapshot = 0;
 
 /* USER CODE END PV */
 
@@ -293,8 +342,9 @@ static uint32_t DutyToCCR(float duty);
 static void FOC_ResetControl(void);
 static void FOC_SetNeutralPWM(void);
 static void FOC_StateManager(void);
+static void FOC_CheckStartButton(void);
 static void FOC_PWM_Enable(void);
-static void FOC_PWM_Disable(void); //只关闭三�??
+static void FOC_PWM_Disable(void); //只关闭三�???
 static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
 static void FOC_TriggerFault(FOC_Fault_t fault_code);
 static void FOC_CheckVdcProtection(void);
@@ -312,6 +362,7 @@ static void Hall_UpdateElectricalAngle(void);
 static void FOC_CheckOverCurrent(void);
 
 static void FOC_AlignTest_Calculate(void);
+static void FOC_RealAlign_PrepareVector(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -393,6 +444,92 @@ static void FOC_SetNeutralPWM(void)
                           mid);
 }
 
+static void FOC_CheckStartButton(void)
+{
+    static uint8_t raw_last = 0U;
+    static uint8_t stable_pressed = 0U;
+
+    static uint8_t armed = 0U;
+    static uint8_t handled = 0U;
+    static uint8_t press_allowed = 0U;
+
+    static uint32_t change_ms = 0U;
+    static uint32_t press_start_ms = 0U;
+
+    uint32_t now = HAL_GetTick();
+
+    uint8_t raw_pressed =
+        (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13)
+         == GPIO_PIN_SET) ? 1U : 0U;
+
+    /* 1. Detect raw input changes */
+    if (raw_pressed != raw_last)
+    {
+        raw_last = raw_pressed;
+        change_ms = now;
+    }
+
+    /* 2. Debounce for 30 ms */
+    if ((uint32_t)(now - change_ms) < SW3_DEBOUNCE_MS)
+    {
+        return;
+    }
+
+    /* 3. Update stable button state */
+    if (raw_pressed != stable_pressed)
+    {
+        stable_pressed = raw_pressed;
+
+        if (stable_pressed)
+        {
+            press_start_ms = now;
+            handled = 0U;
+
+            /* Only a fresh press in READY is accepted */
+            press_allowed =
+                (armed &&
+                 foc_state == FOC_STATE_READY &&
+                 current_offset_done == 1U &&
+                 foc_fault_request == 0U) ? 1U : 0U;
+
+            armed = 0U;
+        }
+        else
+        {
+            /* Release re-arms the button */
+            handled = 0U;
+            armed = 1U;
+        }
+    }
+
+    /* Released: wait for a new press */
+    if (!stable_pressed)
+    {
+        armed = 1U;
+        return;
+    }
+
+    /* 4. Long press, only once per press */
+    if ((!handled) &&
+        ((uint32_t)(now - press_start_ms)
+         >= SW3_LONG_PRESS_MS))
+    {
+        handled = 1U;
+
+        sw3_long_press_count++;
+
+        if (press_allowed &&
+            foc_state == FOC_STATE_READY &&
+            foc_fault_request == 0U &&
+            foc_real_align_request == 0U)
+        {
+            foc_real_align_request = 1U;
+
+            sw3_align_request_count++;
+        }
+    }
+}
+
 static void FOC_StateManager(void)
 {
 
@@ -403,6 +540,7 @@ static void FOC_StateManager(void)
         foc_fault_request = 0;
 
         FOC_PWM_EmergencyDisable();
+        align_after_bootstrap = 0;
 
         FOC_ResetControl();
         FOC_SetNeutralPWM();
@@ -431,6 +569,53 @@ static void FOC_StateManager(void)
 
         case FOC_STATE_READY:
         {
+            /* A dedicated real-alignment request must always charge bootstrap first. */
+            if (foc_real_align_request != 0U)
+            {
+                foc_real_align_request = 0U;
+                if (FOC_CanStart() && hall_angle_valid)
+                {
+                    foc_real_align_done = 0U;
+                    align_max_abs_phase_current = 0.0f;
+                    align_after_bootstrap = 1U;
+                    foc_bootstrap_request = 1U;
+                }
+                break;
+            }
+
+        	if (foc_bootstrap_request)
+        	{
+        	    foc_bootstrap_request = 0;
+
+        	    if (FOC_CanStart())
+        	    {
+        	        /* Disable all three-phase outputs first */
+        	        FOC_PWM_Disable();
+
+        	        FOC_ResetControl();
+
+        	        /* PWM1: CCR=0 means high-side off,
+        	           complementary low-side command active */
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+
+        	        foc_bootstrap_done = 0;
+        	        bootstrap_elapsed_ms = 0;
+        	        bootstrap_ccer_snapshot = 0;
+
+        	        bootstrap_start_ms = HAL_GetTick();
+
+        	        foc_state = FOC_STATE_BOOTSTRAP_PREPARE;
+        	    }
+        	    else
+        	    {
+        	        /* 启动条件不满足，清除待执行的定位任务 */
+        	        align_after_bootstrap = 0U;
+        	    }
+
+        	    break;
+        	}
         	if (foc_align_test_request)
         	{
         	    foc_align_test_request = 0;
@@ -482,7 +667,8 @@ static void FOC_StateManager(void)
                     // FOC_PWM_Enable();
 
 
-                    foc_state = FOC_STATE_RUN;
+                    /* RUN is deliberately locked until actual Hall offset calibration. */
+                    /* foc_state = FOC_STATE_RUN; */
                 }
             }
 
@@ -525,6 +711,151 @@ static void FOC_StateManager(void)
             break;
         }
 
+        case FOC_STATE_BOOTSTRAP_PREPARE:
+        {
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                align_after_bootstrap = 0U;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            /* Wait for CCR=0 to take effect */
+            if ((uint32_t)(HAL_GetTick() - bootstrap_start_ms)
+                >= BOOTSTRAP_PREPARE_MS)
+            {
+                /* Keep high-side channels disabled */
+                CLEAR_BIT(TIM1->CCER,
+                          TIM_CCER_CC1E |
+                          TIM_CCER_CC2E |
+                          TIM_CCER_CC3E);
+
+                /*
+                 * Enable complementary outputs only:
+                 * CH1N, CH2N, CH3N.
+                 */
+                SET_BIT(TIM1->CCER,
+                        TIM_CCER_CC1NE |
+                        TIM_CCER_CC2NE |
+                        TIM_CCER_CC3NE);
+
+                bootstrap_ccer_snapshot =
+                    TIM1->CCER & 0x0555U;
+
+                bootstrap_start_ms = HAL_GetTick();
+
+                foc_state = FOC_STATE_BOOTSTRAP_CHARGE;
+            }
+
+            break;
+        }
+
+        case FOC_STATE_BOOTSTRAP_CHARGE:
+        {
+            bootstrap_elapsed_ms =
+                (uint32_t)(HAL_GetTick() - bootstrap_start_ms);
+
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                align_after_bootstrap = 0U;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            if (bootstrap_elapsed_ms >= BOOTSTRAP_CHARGE_MS)
+            {
+                /* Disable low-side outputs BEFORE restoring CCR */
+                FOC_PWM_Disable();
+
+                FOC_SetNeutralPWM();
+
+                foc_bootstrap_done = 1;
+                if (align_after_bootstrap != 0U)
+                {
+                    align_after_bootstrap = 0U;
+                    FOC_ResetControl();
+                    FOC_RealAlign_PrepareVector();
+                    align_prepare_start_ms = HAL_GetTick();
+                    foc_state = FOC_STATE_ALIGN_PREPARE;
+                }
+                else
+                {
+                    foc_state = FOC_STATE_READY;
+                }
+            }
+
+            break;
+        }
+
+        case FOC_STATE_ALIGN_PREPARE:
+        {
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            if ((uint32_t)(HAL_GetTick() - align_prepare_start_ms) >= ALIGN_PREPARE_MS)
+            {
+#if ALIGN_POWER_ALLOWED
+                if (FOC_CanStart() && hall_angle_valid)
+                {
+                    /* CCRs have been preloaded; now enable physical outputs. */
+                	FOC_PWM_Enable();
+
+                	/* Record PWM enable status */
+                	align_pwm_ccer_snapshot =
+                	    TIM1->CCER & 0x0555U;
+
+                	align_pwm_moe_snapshot =
+                	    ((TIM1->BDTR & TIM_BDTR_MOE) != 0U)
+                	    ? 1U : 0U;
+
+                	align_active_start_ms = HAL_GetTick();
+
+                	foc_state = FOC_STATE_ALIGN_ACTIVE;
+                }
+                else
+                {
+                    FOC_PWM_Disable();
+                    FOC_SetNeutralPWM();
+                    foc_state = FOC_STATE_READY;
+                }
+#else
+                /* Power interlock is closed: never energize motor. */
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+#endif
+            }
+            break;
+        }
+
+        case FOC_STATE_ALIGN_ACTIVE:
+        {
+            uint8_t natural_completion =
+                ((uint32_t)(HAL_GetTick() - align_active_start_ms) >= ALIGN_ACTIVE_MS);
+            if (foc_stop_request || natural_completion)
+            {
+                uint8_t was_cancelled = foc_stop_request;
+                foc_stop_request = 0;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                align_final_sector = hall_sector;
+                foc_real_align_done = (natural_completion && !was_cancelled) ? 1U : 0U;
+                foc_state = FOC_STATE_READY;
+            }
+            break;
+        }
 
         case FOC_STATE_RUN:
         {
@@ -626,6 +957,7 @@ static void FOC_StateManager(void)
     }
 }
 
+
 static void FOC_PWM_Enable(void)
 {
     __HAL_TIM_MOE_ENABLE(&htim1);
@@ -680,11 +1012,15 @@ static void FOC_CheckVdcProtection(void)
 {
     /* ==========================================
      * Over-voltage protection
-     * READY �?? RUN 都可以检测过�??
+     * READY �??? RUN 都可以检测过�???
      * ========================================== */
-    if ((foc_state == FOC_STATE_READY) ||
+    if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+        (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
+    	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
+		(foc_state == FOC_STATE_READY) ||
     	(foc_state == FOC_STATE_ALIGN_TEST) ||
-        (foc_state == FOC_STATE_RUN))
+        (foc_state == FOC_STATE_RUN)  )
     {
         if (vdc_bus > vdc_ov_trip)
         {
@@ -712,9 +1048,14 @@ static void FOC_CheckVdcProtection(void)
 
     /* ==========================================
      * Under-voltage protection
-     * 当前只在 RUN 中检�??
+     * 当前只在 RUN 中检�???
      * ========================================== */
-    if ((foc_state == FOC_STATE_ALIGN_TEST) ||foc_state == FOC_STATE_RUN)
+    if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+        (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
+    	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
+		(foc_state == FOC_STATE_ALIGN_TEST) ||
+		foc_state == FOC_STATE_RUN)
     {
         if (vdc_bus < vdc_uv_trip)
         {
@@ -857,7 +1198,7 @@ static int8_t Hall_StateToSector(uint8_t state)
 static void Hall_UpdateDirection(int8_t new_sector)
 {
     /* Invalid Hall state */
-    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�?
+    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�??
     	                   // 但是在中断中hall_sector = Hall_StateToSector(hall_state);
     {
         hall_direction = HALL_DIR_UNKNOWN;
@@ -866,7 +1207,7 @@ static void Hall_UpdateDirection(int8_t new_sector)
 
 
     /* First valid Hall state */
-    if (hall_prev_sector < 0)  // 当刚�?机没转时候，程序等于没存前一次的sector的�?�，�?以到定义，为�?么定义为-1呢，
+    if (hall_prev_sector < 0)  // 当刚�??机没转时候，程序等于没存前一次的sector的�?�，�??以到定义，为�??么定义为-1呢，
     	                       // 这是因为，为了方便将第一次采集到的�?�幅值给hall_prev_sector
     {
         hall_prev_sector = new_sector;
@@ -1006,7 +1347,7 @@ static void Hall_CheckTimeout(void)
     }
 }
 
-static float WrapAngle0To2Pi(float angle)  //角度归一化
+static float WrapAngle0To2Pi(float angle)  //角度归一�?
 {
     while (angle >= TWO_PI_F)
     {
@@ -1151,6 +1492,21 @@ static void Hall_UpdateElectricalAngle(void)
 // -----------------HALL end----------------------
 
 
+static void FOC_RealAlign_PrepareVector(void)
+{
+    float va = ALIGN_V_ALPHA_V;
+    float vb = 0.0f;
+    SVPWM_Output_t out = {0};
+
+    /* The outputs MUST be disabled before writing these CCR values. */
+    FOC_PWM_Disable();
+    SVPWM_LimitVoltage(&va, &vb, vdc_bus);
+    SVPWM_Run(va, vb, vdc_bus, &out);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DutyToCCR(out.duty_u));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DutyToCCR(out.duty_v));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DutyToCCR(out.duty_w));
+}
+
 static void FOC_AlignTest_Calculate(void)
 {
     float v_alpha = ALIGN_TEST_V_ALPHA_V;
@@ -1270,16 +1626,21 @@ int main(void)
   HAL_ADCEx_InjectedStart_IT(&hadc2);
   HAL_ADCEx_InjectedStart_IT(&hadc1);
 
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+  /*
+   * TIM1 CH1/2/3:
+   * 已完成PWM配置，但暂不启动三相功率输出�?
+   *
+   * TIM1 CH4:
+   * 仅用于触发ADC同步电流采样�?
+   */
+  FOC_PWM_Disable();
 
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-  /* Keep timer running, but disable power outputs */
+  /* Ensure all three phase outputs remain disabled */
   FOC_PWM_Disable();
 
   HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
@@ -1310,16 +1671,21 @@ int main(void)
 	    //HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
 	    //HAL_Delay(500); //LED test
 
-	  FOC_StateManager();//状tai�?
+	  /* Check SW3 button */
+	  FOC_CheckStartButton();
 
+	  /* Process FOC state transitions */
+	  FOC_StateManager();
+
+	  /* Hall timeout monitoring */
 	  Hall_CheckTimeout();
 
 
-	  if (hall_uart_pending)
+	  /*  if (hall_uart_pending)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�?
+	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�??
 
 	      hall_uart_pending = 0;
 
@@ -1348,7 +1714,7 @@ int main(void)
 	      else
 	      {
 	          dir_str = "UNKNOWN";
-	      }
+	      }*/
 
 	      /* int len =
 	          snprintf(tx_buffer,
@@ -1363,7 +1729,7 @@ int main(void)
 	                   hall_speed_rpm,
 	                   hall_omega_e,
 	                   hall_speed_valid);*/
-	      int len =
+	  /* int len =
 	          snprintf(tx_buffer,
 	                   sizeof(tx_buffer),
 	                   "ThetaHall=%.3f Sector=%d RPM=%.1f We=%.2f Valid=%u\r\n",
@@ -1378,6 +1744,42 @@ int main(void)
 	                        (uint8_t *)tx_buffer,
 	                        len,
 	                        HAL_MAX_DELAY);
+	  }*/
+
+	  /* Hall electrical angle offset test: UART output */
+	  /* Hall FOC electrical angle UART test */
+	  if ((uint32_t)(HAL_GetTick() - angle_uart_last_ms) >= 100U)
+	  {
+	      angle_uart_last_ms = HAL_GetTick();
+
+	      float theta_hall = hall_theta_rel;
+	      float theta_corrected = hall_theta_corrected_test;
+	      float theta_foc = theta_e_foc;
+
+	      uint8_t valid = hall_angle_valid;
+
+	      uint32_t pwm_mask = TIM1->CCER & 0x0555U;
+
+	      int len = snprintf(
+	          tx_buffer,
+	          sizeof(tx_buffer),
+	          "Hall=%.3f Corrected=%.3f FOC=%.3f Valid=%u PWM=%lu\r\n",
+	          theta_hall,
+	          theta_corrected,
+	          theta_foc,
+	          (unsigned int)valid,
+	          (unsigned long)pwm_mask
+	      );
+
+	      if ((len > 0) && (len < (int)sizeof(tx_buffer)))
+	      {
+	          HAL_UART_Transmit(
+	              &huart3,
+	              (uint8_t *)tx_buffer,
+	              (uint16_t)len,
+	              HAL_MAX_DELAY
+	          );
+	      }
 	  }
 
   }
@@ -1898,12 +2300,18 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : START_BTN_Pin */
+  GPIO_InitStruct.Pin = START_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(START_BTN_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LED1_Pin */
   GPIO_InitStruct.Pin = LED1_Pin;
@@ -1922,6 +2330,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
+        /* A 1-ms independent (from main loop) alignment time cap. */
+        if ((foc_state == FOC_STATE_ALIGN_ACTIVE) &&
+            (uint32_t)(HAL_GetTick() - align_active_start_ms) >= ALIGN_ACTIVE_MS)
+        {
+            FOC_PWM_Disable();
+        }
         timer_counter++; //1ms 1times
 
         if (timer_counter >= 1000) //1s
@@ -1959,7 +2373,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
         current_sample_ready = 0;
 
-		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �?? FAULT 状�?�需要知�?? Vdc
+		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �??? FAULT 状�?�需要知�??? Vdc
 
         adc_injected_count++;
 
@@ -1967,7 +2381,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         FOC_CheckVdcProtection();
 
 
-        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�??1）中的FOC_StateManager();执行之后
+        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�???1）中的FOC_StateManager();执行之后
         {
             return;
         }
@@ -1999,14 +2413,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             }
             /*
              * 很重要：
-             * CALIBRATION 状�?�做到这里就结束本次ADC回调�??
-             * 不继续算电流、Park、PI�??
+             * CALIBRATION 状�?�做到这里就结束本次ADC回调�???
+             * 不继续算电流、Park、PI�???
              */
             return;
         }
 
         /* ==================================================
-         * 2. INIT / FAULT 状�?�直接�??�??
+         * 2. INIT / FAULT 状�?�直接�??�???
          * ================================================== */
         if ((foc_state == FOC_STATE_INIT) ||
             (foc_state == FOC_STATE_FAULT))
@@ -2016,8 +2430,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         /* ---------- Current calculation ---------- */
         /* ==================================================
-         * 3. READY �?? RUN 都允许走到这�??
-         *    �??以继续计算实际电�??
+         * 3. READY �??? RUN 都允许走到这�???
+         *    �???以继续计算实际电�???
          * ================================================== */
 
         //standard FOC current direction e=i^*-i
@@ -2040,9 +2454,19 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		iu_ma = (int32_t)(iu_a * 1000.0f);
 		iv_ma = (int32_t)(iv_a * 1000.0f);
 
-		FOC_CheckOverCurrent();
+        FOC_CheckOverCurrent();
 
-		if (foc_fault_request)
+        if (foc_state == FOC_STATE_ALIGN_ACTIVE)
+        {
+            float iabs = iu_a < 0.0f ? -iu_a : iu_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+            iabs = iv_a < 0.0f ? -iv_a : iv_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+            iabs = iw_a < 0.0f ? -iw_a : iw_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+        }
+
+        if (foc_fault_request)
 		{
 		    return;
 		}
@@ -2063,12 +2487,30 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		/* Update real Hall interpolated angle */
 		/*
 		 * 不要只在 Hall 边沿中断里运行此函数
-		 *  因为如果只在 Hall ISR 里算：
-		 *  一个Hall边沿 → 算一次角度
-		 *  直到下一个Hall边沿 → 才再更新
-		 *  这仍然不是连续角度，所以放在20 kHz ADC 同步控制 ISR 中。
+		 *  因为如果只在 Hall ISR 里算�?
+		 *  �?个Hall边沿 �? 算一次角�?
+		 *  直到下一个Hall边沿 �? 才再更新
+		 *  这仍然不是连续角度，�?以放�?20 kHz ADC 同步控制 ISR 中�??
 		 */
 		Hall_UpdateElectricalAngle();
+
+		/* Update FOC electrical angle from Hall */
+		if (hall_angle_valid)
+		{
+		    hall_theta_corrected_test =WrapAngle0To2Pi(hall_theta_rel + hall_offset_test_rad);
+
+		    theta_e_foc = hall_theta_corrected_test;
+		}
+
+
+		/* RUN状�?�下�?查Hall角度有效�? */
+		if (((foc_state == FOC_STATE_RUN) ||
+             (foc_state == FOC_STATE_ALIGN_ACTIVE)) &&
+            (hall_angle_valid == 0U))
+		{
+		    FOC_TriggerFault(FOC_FAULT_HALL_INVALID);
+		    return;
+		}
 
 		/* Alignment software-only test */
 		if (foc_state == FOC_STATE_ALIGN_TEST)
@@ -2077,10 +2519,17 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		    return;
 		}
 
+        /* During fixed-vector alignment, do not run the current PI. */
+        if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+            (foc_state == FOC_STATE_ALIGN_ACTIVE))
+        {
+            return;
+        }
+
 		/* Park Transform */
 		Park_Run(i_ab.alpha,
 				 i_ab.beta,
-				 theta_e_test,
+				 theta_e_foc,
 				 &i_dq);
 
 		/* ==================================================
@@ -2124,7 +2573,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		/* Inverse Park */
 		InvPark_Run(vd_cmd,
 					vq_cmd,
-					theta_e_test,
+					theta_e_foc,
 					&v_ab);
 
 		/* Copy voltage command */
