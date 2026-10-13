@@ -47,6 +47,7 @@ typedef enum
 
     FOC_STATE_ALIGN_PREPARE,
     FOC_STATE_ALIGN_ACTIVE,
+    FOC_STATE_OPEN_LOOP,  /* rotating voltage vector; no Hall offset required */
 
     FOC_STATE_RUN,
 
@@ -136,8 +137,19 @@ UART_HandleTypeDef huart3;
 /* Real alignment: disabled by default until power-stage safeguards are verified. */
 #define ALIGN_POWER_ALLOWED   1U
 #define ALIGN_PREPARE_MS      2U
-#define ALIGN_ACTIVE_MS       100U
-#define ALIGN_V_ALPHA_V       0.5f
+#define ALIGN_ACTIVE_MS       250U   /* previously observed real motor response */
+#define ALIGN_V_ALPHA_V       1.0f
+
+/* First low-speed open-loop attempt: independent from Hall electrical offset. */
+#define OPEN_LOOP_AFTER_ALIGN       1U
+#define OPEN_LOOP_VOLTAGE_V         1.0f
+#define OPEN_LOOP_TARGET_RPM       15.0f   /* mechanical rpm, NOT electrical rpm */
+#define OPEN_LOOP_RAMP_MS           1000U
+#define OPEN_LOOP_DURATION_MS       3000U  /* includes the 1-second acceleration */
+/* 20 kHz ADC callback -> 20 update ticks per ms. */
+#define OPEN_LOOP_RAMP_TICKS        (OPEN_LOOP_RAMP_MS * 20U)
+/* Small grace period for main-loop state transition; TIM6 still imposes a cap. */
+#define ALIGN_TO_OPENLOOP_GRACE_MS  20U
 
 volatile uint8_t current_oc_counter = 0;
 
@@ -321,6 +333,20 @@ volatile uint32_t sw3_align_request_count = 0;
 volatile uint32_t align_pwm_ccer_snapshot = 0;
 volatile uint8_t align_pwm_moe_snapshot = 0;
 
+/* Open-loop diagnostics: values remain available after the run. */
+volatile uint8_t foc_open_loop_done = 0U;
+volatile uint8_t open_loop_timeout_hit = 0U;
+volatile uint32_t open_loop_start_ms = 0U;
+volatile uint32_t open_loop_tick_count = 0U;
+volatile uint32_t open_loop_control_count = 0U;
+volatile float open_loop_theta_e = 0.0f;
+volatile float open_loop_speed_cmd_rpm = 0.0f;
+volatile float open_loop_peak_current_a = 0.0f;
+volatile uint32_t open_loop_hall_edge_start = 0U;
+volatile uint32_t open_loop_hall_edge_delta = 0U;
+volatile float open_loop_last_hall_rpm = 0.0f;
+volatile int8_t open_loop_last_hall_direction = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -363,6 +389,8 @@ static void FOC_CheckOverCurrent(void);
 
 static void FOC_AlignTest_Calculate(void);
 static void FOC_RealAlign_PrepareVector(void);
+static void FOC_OpenLoop_Begin(void);
+static void FOC_OpenLoop_Update(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -488,7 +516,8 @@ static void FOC_CheckStartButton(void)
             /* Only a fresh press in READY is accepted */
             press_allowed =
                 (armed &&
-                 foc_state == FOC_STATE_READY &&
+                 ((foc_state == FOC_STATE_READY) ||
+                  (foc_state == FOC_STATE_OPEN_LOOP)) &&
                  current_offset_done == 1U &&
                  foc_fault_request == 0U) ? 1U : 0U;
 
@@ -519,12 +548,18 @@ static void FOC_CheckStartButton(void)
         sw3_long_press_count++;
 
         if (press_allowed &&
-            foc_state == FOC_STATE_READY &&
-            foc_fault_request == 0U &&
-            foc_real_align_request == 0U)
+            (foc_state == FOC_STATE_OPEN_LOOP) &&
+            foc_fault_request == 0U)
+        {
+            /* Long press again during open-loop -> request early stop. */
+            foc_stop_request = 1U;
+        }
+        else if (press_allowed &&
+                 foc_state == FOC_STATE_READY &&
+                 foc_fault_request == 0U &&
+                 foc_real_align_request == 0U)
         {
             foc_real_align_request = 1U;
-
             sw3_align_request_count++;
         }
     }
@@ -848,10 +883,44 @@ static void FOC_StateManager(void)
             {
                 uint8_t was_cancelled = foc_stop_request;
                 foc_stop_request = 0;
-                FOC_PWM_Disable();
-                FOC_SetNeutralPWM();
                 align_final_sector = hall_sector;
                 foc_real_align_done = (natural_completion && !was_cancelled) ? 1U : 0U;
+
+                if (foc_real_align_done &&
+                    (foc_fault_request == 0U) &&
+                    (foc_fault_code == FOC_FAULT_NONE) &&
+                    ((TIM1->CCER & 0x0555U) == 0x0555U) &&
+                    (OPEN_LOOP_AFTER_ALIGN != 0U))
+                {
+                    /* IMPORTANT: keep PWM ON; start at theta=0 with same voltage. */
+                    FOC_OpenLoop_Begin();
+                    foc_state = FOC_STATE_OPEN_LOOP;
+                }
+                else
+                {
+                    FOC_PWM_Disable();
+                    FOC_SetNeutralPWM();
+                    foc_state = FOC_STATE_READY;
+                }
+            }
+            break;
+        }
+
+        case FOC_STATE_OPEN_LOOP:
+        {
+            uint8_t elapsed =
+                ((uint32_t)(HAL_GetTick() - open_loop_start_ms) >= OPEN_LOOP_DURATION_MS);
+            if (foc_stop_request || open_loop_timeout_hit || elapsed)
+            {
+                uint8_t stopped_early = foc_stop_request;
+                foc_stop_request = 0U;
+                /* Disable output BEFORE restoring neutral CCR values. */
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                open_loop_hall_edge_delta = hall_edge_count - open_loop_hall_edge_start;
+                foc_open_loop_done = (!stopped_early &&
+                                     foc_fault_request == 0U &&
+                                     foc_fault_code == FOC_FAULT_NONE) ? 1U : 0U;
                 foc_state = FOC_STATE_READY;
             }
             break;
@@ -1016,6 +1085,7 @@ static void FOC_CheckVdcProtection(void)
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_OPEN_LOOP) ||
         (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
     	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
 		(foc_state == FOC_STATE_READY) ||
@@ -1052,6 +1122,7 @@ static void FOC_CheckVdcProtection(void)
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_OPEN_LOOP) ||
         (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
     	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
 		(foc_state == FOC_STATE_ALIGN_TEST) ||
@@ -1507,6 +1578,77 @@ static void FOC_RealAlign_PrepareVector(void)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DutyToCCR(out.duty_w));
 }
 
+/* Reset all open-loop status BEFORE changing foc_state to OPEN_LOOP. */
+static void FOC_OpenLoop_Begin(void)
+{
+    foc_open_loop_done = 0U;
+    open_loop_timeout_hit = 0U;
+    open_loop_tick_count = 0U;
+    open_loop_control_count = 0U;
+    open_loop_theta_e = 0.0f;         /* seamless transition from alignment at alpha axis */
+    open_loop_speed_cmd_rpm = 0.0f;
+    open_loop_peak_current_a = 0.0f;
+    open_loop_hall_edge_start = hall_edge_count;
+    open_loop_hall_edge_delta = 0U;
+    open_loop_last_hall_rpm = 0.0f;
+    open_loop_last_hall_direction = 0;
+    open_loop_start_ms = HAL_GetTick();
+}
+
+/* Called at 20 kHz INSIDE the ADC injected callback, only in OPEN_LOOP. */
+static void FOC_OpenLoop_Update(void)
+{
+    float ramp;
+    float omega_e;
+    float va, vb;
+    AlphaBeta_t voltage_ab = {0};
+    SVPWM_Output_t duty = {0};
+
+    if ((open_loop_timeout_hit != 0U) || (foc_fault_request != 0U))
+    {
+        return;
+    }
+
+    open_loop_control_count++;
+
+    /* Stop if the bus leaves the permitted range; do not divide by an invalid Vdc. */
+    if (vdc_bus <= vdc_uv_trip)
+    {
+        FOC_TriggerFault(FOC_FAULT_VDC_UNDERVOLTAGE);
+        return;
+    }
+    if (vdc_bus >= vdc_ov_trip)
+    {
+        FOC_TriggerFault(FOC_FAULT_VDC_OVERVOLTAGE);
+        return;
+    }
+
+    /* A discrete speed ramp avoids a sudden jump to the commanded speed. */
+    if (open_loop_tick_count < OPEN_LOOP_RAMP_TICKS)
+    {
+        open_loop_tick_count++;
+    }
+
+    ramp = (float)open_loop_tick_count / (float)OPEN_LOOP_RAMP_TICKS;
+    open_loop_speed_cmd_rpm = OPEN_LOOP_TARGET_RPM * ramp;
+
+    omega_e = (TWO_PI_F * MOTOR_POLE_PAIRS / 60.0f)
+              * open_loop_speed_cmd_rpm;
+    open_loop_theta_e = WrapAngle0To2Pi(
+        open_loop_theta_e + omega_e * CURRENT_LOOP_TS);
+
+    /* Rotate vd=constant, vq=0 through an artificial electrical angle. */
+    InvPark_Run(OPEN_LOOP_VOLTAGE_V, 0.0f, open_loop_theta_e, &voltage_ab);
+    va = voltage_ab.alpha;
+    vb = voltage_ab.beta;
+    SVPWM_LimitVoltage(&va, &vb, vdc_bus);
+    SVPWM_Run(va, vb, vdc_bus, &duty);
+
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DutyToCCR(duty.duty_u));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DutyToCCR(duty.duty_v));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DutyToCCR(duty.duty_w));
+}
+
 static void FOC_AlignTest_Calculate(void)
 {
     float v_alpha = ALIGN_TEST_V_ALPHA_V;
@@ -1748,27 +1890,23 @@ int main(void)
 
 	  /* Hall electrical angle offset test: UART output */
 	  /* Hall FOC electrical angle UART test */
-	  if ((uint32_t)(HAL_GetTick() - angle_uart_last_ms) >= 100U)
+	  if ((foc_state != FOC_STATE_ALIGN_ACTIVE) &&
+          ((uint32_t)(HAL_GetTick() - angle_uart_last_ms) >= 100U))
 	  {
 	      angle_uart_last_ms = HAL_GetTick();
 
-	      float theta_hall = hall_theta_rel;
-	      float theta_corrected = hall_theta_corrected_test;
-	      float theta_foc = theta_e_foc;
-
-	      uint8_t valid = hall_angle_valid;
-
-	      uint32_t pwm_mask = TIM1->CCER & 0x0555U;
-
+	      /* Latest open-loop debug values persist after the automatic stop. */
 	      int len = snprintf(
 	          tx_buffer,
 	          sizeof(tx_buffer),
-	          "Hall=%.3f Corrected=%.3f FOC=%.3f Valid=%u PWM=%lu\r\n",
-	          theta_hall,
-	          theta_corrected,
-	          theta_foc,
-	          (unsigned int)valid,
-	          (unsigned long)pwm_mask
+	          "St=%d Cmd=%.1f Hall=%.1f Ed=%lu Ipk=%.3f Done=%u Fault=%d\r\n",
+	          (int)foc_state,
+	          open_loop_speed_cmd_rpm,
+	          open_loop_last_hall_rpm,
+	          (unsigned long)open_loop_hall_edge_delta,
+	          open_loop_peak_current_a,
+	          (unsigned int)foc_open_loop_done,
+	          (int)foc_fault_code
 	      );
 
 	      if ((len > 0) && (len < (int)sizeof(tx_buffer)))
@@ -2330,11 +2468,21 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)
     {
-        /* A 1-ms independent (from main loop) alignment time cap. */
+        /* Allow up to 20 ms for ALIGN -> OPEN_LOOP handoff.
+         * The TIM6 hard cutoff remains independent of blocking UART calls. */
         if ((foc_state == FOC_STATE_ALIGN_ACTIVE) &&
-            (uint32_t)(HAL_GetTick() - align_active_start_ms) >= ALIGN_ACTIVE_MS)
+            (uint32_t)(HAL_GetTick() - align_active_start_ms) >=
+                (ALIGN_ACTIVE_MS +
+                 ((OPEN_LOOP_AFTER_ALIGN != 0U) ? ALIGN_TO_OPENLOOP_GRACE_MS : 0U)))
         {
             FOC_PWM_Disable();
+        }
+        if ((foc_state == FOC_STATE_OPEN_LOOP) &&
+            ((uint32_t)(HAL_GetTick() - open_loop_start_ms) >= OPEN_LOOP_DURATION_MS))
+        {
+            /* TIM6 shutdown still runs if the main loop is delayed by UART. */
+            FOC_PWM_Disable();
+            open_loop_timeout_hit = 1U;
         }
         timer_counter++; //1ms 1times
 
@@ -2454,6 +2602,16 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		iu_ma = (int32_t)(iu_a * 1000.0f);
 		iv_ma = (int32_t)(iv_a * 1000.0f);
 
+        if (foc_state == FOC_STATE_OPEN_LOOP)
+        {
+            float iabs = (iu_a >= 0.0f) ? iu_a : -iu_a;
+            float vabs = (iv_a >= 0.0f) ? iv_a : -iv_a;
+            float wabs = (iu_a + iv_a >= 0.0f) ? (iu_a + iv_a) : -(iu_a + iv_a);
+            if (iabs > open_loop_peak_current_a) open_loop_peak_current_a = iabs;
+            if (vabs > open_loop_peak_current_a) open_loop_peak_current_a = vabs;
+            if (wabs > open_loop_peak_current_a) open_loop_peak_current_a = wabs;
+        }
+
         FOC_CheckOverCurrent();
 
         if (foc_state == FOC_STATE_ALIGN_ACTIVE)
@@ -2518,6 +2676,19 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		    FOC_AlignTest_Calculate();
 		    return;
 		}
+
+        /* Open-loop is independent from Hall offset and bypasses current PI. */
+        if (foc_state == FOC_STATE_OPEN_LOOP)
+        {
+            open_loop_hall_edge_delta = hall_edge_count - open_loop_hall_edge_start;
+            if (hall_speed_valid)
+            {
+                open_loop_last_hall_rpm = hall_speed_rpm;
+                open_loop_last_hall_direction = (int8_t)hall_direction;
+            }
+            FOC_OpenLoop_Update();
+            return;
+        }
 
         /* During fixed-vector alignment, do not run the current PI. */
         if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
