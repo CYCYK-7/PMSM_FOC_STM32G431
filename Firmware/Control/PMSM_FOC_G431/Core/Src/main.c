@@ -61,15 +61,11 @@ typedef enum
 typedef enum
 {
     FOC_FAULT_NONE = 0,
-
-    FOC_FAULT_VDC_UNDERVOLTAGE,  //欠压
-
-    FOC_FAULT_VDC_OVERVOLTAGE, //过压
-
-	FOC_FAULT_OVERCURRENT,
-
-	FOC_FAULT_HALL_INVALID  // Hall电角度无�??
-
+    FOC_FAULT_VDC_UNDERVOLTAGE,
+    FOC_FAULT_VDC_OVERVOLTAGE,
+    FOC_FAULT_OVERCURRENT,
+    FOC_FAULT_HALL_INVALID,
+    FOC_FAULT_HW_BREAK
 } FOC_Fault_t;
 
 typedef enum
@@ -98,8 +94,13 @@ ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
+COMP_HandleTypeDef hcomp1;
+
+DAC_HandleTypeDef hdac3;
+
 OPAMP_HandleTypeDef hopamp1;
 OPAMP_HandleTypeDef hopamp2;
+OPAMP_HandleTypeDef hopamp3;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
@@ -119,7 +120,7 @@ DMA_HandleTypeDef hdma_usart3_tx;
 #define VDC_R_HIGH           75.0f
 #define VDC_R_LOW            3.0f
 
-#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�????
+#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�?????
 #define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 #define CURRENT_A_PER_COUNT  0.02198f
 
@@ -294,7 +295,7 @@ volatile uint32_t pwm_ccr_u = 0;
 volatile uint32_t pwm_ccr_v = 0;
 volatile uint32_t pwm_ccr_w = 0;
 
-float v_alpha_cmd = 0.0f; //�????终�?�给SVPWM的电�????
+float v_alpha_cmd = 0.0f; //�?????终�?�给SVPWM的电�?????
 float v_beta_cmd  = 0.0f;
 
 volatile uint8_t foc_enable = 0;//目前没有接入真正的角度，还没有真正的电机闭环
@@ -342,11 +343,11 @@ volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
 volatile float hall_speed_rpm = 0.0f;
 volatile float hall_omega_e = 0.0f;
 volatile float hall_omega_m = 0.0f;
-volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�??
+volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�???
 volatile uint32_t hall_last_edge_ms = 0;
 
 //theta
-volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�??0~2π
+volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�???0~2π
 volatile uint8_t hall_angle_valid = 0;
 
 volatile uint32_t hall_angle_update_count = 0;
@@ -570,6 +571,9 @@ static void MX_OPAMP1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_OPAMP2_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_DAC3_Init(void);
+static void MX_OPAMP3_Init(void);
+static void MX_COMP1_Init(void);
 /* USER CODE BEGIN PFP */
 
 static uint32_t DutyToCCR(float duty);
@@ -579,7 +583,7 @@ static void FOC_SetNeutralPWM(void);
 static void FOC_StateManager(void);
 static void FOC_CheckStartButton(void);
 static void FOC_PWM_Enable(void);
-static void FOC_PWM_Disable(void); //只关闭三�????
+static void FOC_PWM_Disable(void); //只关闭三�?????
 static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
 static void FOC_TriggerFault(FOC_Fault_t fault_code);
 static void FOC_CheckVdcProtection(void);
@@ -788,6 +792,12 @@ static void FOC_CheckStartButton(void)
 static void FOC_StateManager(void)
 {
 
+	/* 检查 TIM1 硬件 Break 事件 */
+	if ((foc_state != FOC_STATE_FAULT) &&
+	    ((TIM1->SR & TIM_SR_BIF) != 0U))
+	{
+	    FOC_TriggerFault(FOC_FAULT_HW_BREAK);
+	}
 
 	/* ---------- Global fault request ---------- */
     if (foc_fault_request)
@@ -1350,7 +1360,7 @@ static void FOC_CheckVdcProtection(void)
 {
     /* ==========================================
      * Over-voltage protection
-     * READY �???? RUN 都可以检测过�????
+     * READY �????? RUN 都可以检测过�?????
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
@@ -1387,7 +1397,7 @@ static void FOC_CheckVdcProtection(void)
 
     /* ==========================================
      * Under-voltage protection
-     * 当前只在 RUN 中检�????
+     * 当前只在 RUN 中检�?????
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
@@ -1538,7 +1548,7 @@ static int8_t Hall_StateToSector(uint8_t state)
 static void Hall_UpdateDirection(int8_t new_sector)
 {
     /* Invalid Hall state */
-    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�???
+    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�????
     	                   // 但是在中断中hall_sector = Hall_StateToSector(hall_state);
     {
         hall_direction = HALL_DIR_UNKNOWN;
@@ -1547,7 +1557,7 @@ static void Hall_UpdateDirection(int8_t new_sector)
 
 
     /* First valid Hall state */
-    if (hall_prev_sector < 0)  // 当刚�???机没转时候，程序等于没存前一次的sector的�?�，�???以到定义，为�???么定义为-1呢，
+    if (hall_prev_sector < 0)  // 当刚�????机没转时候，程序等于没存前一次的sector的�?�，�????以到定义，为�????么定义为-1呢，
     	                       // 这是因为，为了方便将第一次采集到的�?�幅值给hall_prev_sector
     {
         hall_prev_sector = new_sector;
@@ -1790,7 +1800,7 @@ static void Hall_CheckTimeout(void)
     }
 }
 
-static float WrapAngle0To2Pi(float angle)  //角度归一�??
+static float WrapAngle0To2Pi(float angle)  //角度归一�???
 {
     while (angle >= TWO_PI_F)
     {
@@ -2587,6 +2597,9 @@ int main(void)
   MX_ADC2_Init();
   MX_OPAMP2_Init();
   MX_TIM1_Init();
+  MX_DAC3_Init();
+  MX_OPAMP3_Init();
+  MX_COMP1_Init();
   /* USER CODE BEGIN 2 */
 
   theta_e_step = 6.283185307f / 20000.0f;
@@ -2625,6 +2638,40 @@ int main(void)
   HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不dui
   HAL_OPAMP_Start(&hopamp2);
 
+  /* ========== 10B: DAC + COMP + TIM1 Break ========== */
+
+  /* 1. 暂时保持三相功率 PWM 关闭 */
+  FOC_PWM_Disable();
+
+  /* 2. 启动第三路运放 */
+  if (HAL_OPAMP_Start(&hopamp3) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* 3. 设置 DAC3 比较阈值 */
+  if (HAL_DAC_SetValue(&hdac3,
+                       DAC_CHANNEL_1,
+                       DAC_ALIGN_12B_R,
+                       3000U) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* 4. 启动 DAC3 */
+  if (HAL_DAC_Start(&hdac3, DAC_CHANNEL_1) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* 5. 启动 COMP1 */
+  if (HAL_COMP_Start(&hcomp1) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* ========== 10B END ========== */
+
   /* ADC校准 */
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);  //校准
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
@@ -2643,10 +2690,10 @@ int main(void)
 
   /*
    * TIM1 CH1/2/3:
-   * 已完成PWM配置，但暂不启动三相功率输出�??
+   * 已完成PWM配置，但暂不启动三相功率输出�???
    *
    * TIM1 CH4:
-   * 仅用于触发ADC同步电流采样�??
+   * 仅用于触发ADC同步电流采样�???
    */
   FOC_PWM_Disable();
 
@@ -2695,10 +2742,30 @@ int main(void)
 	    //HAL_Delay(500); //LED test
 
 	  /* Check SW3 button */
-	  FOC_CheckStartButton();
+	  //FOC_CheckStartButton();
 
 	  /* Process FOC state transitions */
 	  FOC_StateManager();
+
+	  /* ===== 10C: TIM1 Break 临时验证 ===== */
+
+	  static uint8_t break_test_done = 0U;
+
+	  if ((break_test_done == 0U) &&
+	      (foc_state == FOC_STATE_READY) &&
+	      (HAL_GetTick() >= 2000U))
+	  {
+	      break_test_done = 1U;
+
+	      HAL_DAC_SetValue(
+	          &hdac3,
+	          DAC_CHANNEL_1,
+	          DAC_ALIGN_12B_R,
+	          1000U
+	      );
+	  }
+
+	  /* ===== 10C END ===== */
 
 	  /* Hall timeout monitoring */
 	  Hall_CheckTimeout();
@@ -2706,7 +2773,7 @@ int main(void)
 
 
 
-	  /* Only in foreground, not in the 20kHz ADC interrupt. */
+	  /* Only in foreground, not in the 20kHz ADC interrupt.  */
 	  static uint32_t last_vofa_ms = 0U;
 
 	  uint32_t now_ms = HAL_GetTick();
@@ -2739,7 +2806,7 @@ int main(void)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�???
+	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�????
 
 	      hall_uart_pending = 0;
 
@@ -3036,6 +3103,85 @@ static void MX_ADC2_Init(void)
 }
 
 /**
+  * @brief COMP1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_COMP1_Init(void)
+{
+
+  /* USER CODE BEGIN COMP1_Init 0 */
+
+  /* USER CODE END COMP1_Init 0 */
+
+  /* USER CODE BEGIN COMP1_Init 1 */
+
+  /* USER CODE END COMP1_Init 1 */
+  hcomp1.Instance = COMP1;
+  hcomp1.Init.InputPlus = COMP_INPUT_PLUS_IO2;
+  hcomp1.Init.InputMinus = COMP_INPUT_MINUS_DAC3_CH1;
+  hcomp1.Init.OutputPol = COMP_OUTPUTPOL_NONINVERTED;
+  hcomp1.Init.Hysteresis = COMP_HYSTERESIS_NONE;
+  hcomp1.Init.BlankingSrce = COMP_BLANKINGSRC_NONE;
+  hcomp1.Init.TriggerMode = COMP_TRIGGERMODE_NONE;
+  if (HAL_COMP_Init(&hcomp1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN COMP1_Init 2 */
+
+  /* USER CODE END COMP1_Init 2 */
+
+}
+
+/**
+  * @brief DAC3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC3_Init(void)
+{
+
+  /* USER CODE BEGIN DAC3_Init 0 */
+
+  /* USER CODE END DAC3_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC3_Init 1 */
+
+  /* USER CODE END DAC3_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac3.Instance = DAC3;
+  if (HAL_DAC_Init(&hdac3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
+  sConfig.DAC_DMADoubleDataMode = DISABLE;
+  sConfig.DAC_SignedFormat = DISABLE;
+  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_Trigger2 = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_DISABLE;
+  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_INTERNAL;
+  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+  if (HAL_DAC_ConfigChannel(&hdac3, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC3_Init 2 */
+
+  /* USER CODE END DAC3_Init 2 */
+
+}
+
+/**
   * @brief OPAMP1 Initialization Function
   * @param None
   * @retval None
@@ -3102,6 +3248,39 @@ static void MX_OPAMP2_Init(void)
 }
 
 /**
+  * @brief OPAMP3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP3_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP3_Init 0 */
+
+  /* USER CODE END OPAMP3_Init 0 */
+
+  /* USER CODE BEGIN OPAMP3_Init 1 */
+
+  /* USER CODE END OPAMP3_Init 1 */
+  hopamp3.Instance = OPAMP3;
+  hopamp3.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp3.Init.Mode = OPAMP_STANDALONE_MODE;
+  hopamp3.Init.InvertingInput = OPAMP_INVERTINGINPUT_IO0;
+  hopamp3.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp3.Init.InternalOutput = DISABLE;
+  hopamp3.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp3.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP3_Init 2 */
+
+  /* USER CODE END OPAMP3_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -3114,6 +3293,7 @@ static void MX_TIM1_Init(void)
   /* USER CODE END TIM1_Init 0 */
 
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIMEx_BreakInputConfigTypeDef sBreakInputConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
@@ -3135,6 +3315,13 @@ static void MX_TIM1_Init(void)
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakInputConfig.Source = TIM_BREAKINPUTSOURCE_COMP1;
+  sBreakInputConfig.Enable = TIM_BREAKINPUTSOURCE_ENABLE;
+  sBreakInputConfig.Polarity = TIM_BREAKINPUTSOURCE_POLARITY_HIGH;
+  if (HAL_TIMEx_ConfigBreakInput(&htim1, TIM_BREAKINPUT_BRK, &sBreakInputConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -3168,9 +3355,9 @@ static void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
   sBreakDeadTimeConfig.DeadTime = 85;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_ENABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakFilter = 2;
   sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
   sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
   sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
@@ -3475,7 +3662,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
         current_sample_ready = 0;
 
-		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �???? FAULT 状�?�需要知�???? Vdc
+		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �????? FAULT 状�?�需要知�????? Vdc
 
         adc_injected_count++;
 
@@ -3483,7 +3670,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         FOC_CheckVdcProtection();
 
 
-        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�????1）中的FOC_StateManager();执行之后
+        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�?????1）中的FOC_StateManager();执行之后
         {
             return;
         }
@@ -3515,14 +3702,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             }
             /*
              * 很重要：
-             * CALIBRATION 状�?�做到这里就结束本次ADC回调�????
-             * 不继续算电流、Park、PI�????
+             * CALIBRATION 状�?�做到这里就结束本次ADC回调�?????
+             * 不继续算电流、Park、PI�?????
              */
             return;
         }
 
         /* ==================================================
-         * 2. INIT / FAULT 状�?�直接�??�????
+         * 2. INIT / FAULT 状�?�直接�??�?????
          * ================================================== */
         if ((foc_state == FOC_STATE_INIT) ||
             (foc_state == FOC_STATE_FAULT))
@@ -3532,8 +3719,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         /* ---------- Current calculation ---------- */
         /* ==================================================
-         * 3. READY �???? RUN 都允许走到这�????
-         *    �????以继续计算实际电�????
+         * 3. READY �????? RUN 都允许走到这�?????
+         *    �?????以继续计算实际电�?????
          * ================================================== */
 
         //standard FOC current direction e=i^*-i
@@ -3609,10 +3796,10 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		/* Update real Hall interpolated angle */
 		/*
 		 * 不要只在 Hall 边沿中断里运行此函数
-		 *  因为如果只在 Hall ISR 里算�??
-		 *  �??个Hall边沿 �?? 算一次角�??
-		 *  直到下一个Hall边沿 �?? 才再更新
-		 *  这仍然不是连续角度，�??以放�??20 kHz ADC 同步控制 ISR 中�??
+		 *  因为如果只在 Hall ISR 里算�???
+		 *  �???个Hall边沿 �??? 算一次角�???
+		 *  直到下一个Hall边沿 �??? 才再更新
+		 *  这仍然不是连续角度，�???以放�???20 kHz ADC 同步控制 ISR 中�??
 		 */
 		Hall_UpdateElectricalAngle();
 
@@ -3625,7 +3812,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		}
 
 
-		/* RUN状�?�下�??查Hall角度有效�?? */
+		/* RUN状�?�下�???查Hall角度有效�??? */
 		if (((foc_state == FOC_STATE_RUN) ||
              (foc_state == FOC_STATE_ALIGN_ACTIVE)) &&
             (hall_angle_valid == 0U))

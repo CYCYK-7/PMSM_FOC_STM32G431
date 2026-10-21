@@ -286,6 +286,120 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* hadc)
 }
 
 /**
+* @brief COMP MSP Initialization
+* This function configures the hardware resources used in this example
+* @param hcomp: COMP handle pointer
+* @retval None
+*/
+void HAL_COMP_MspInit(COMP_HandleTypeDef* hcomp)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(hcomp->Instance==COMP1)
+  {
+  /* USER CODE BEGIN COMP1_MspInit 0 */
+
+  /* USER CODE END COMP1_MspInit 0 */
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    /**COMP1 GPIO Configuration
+    PB1     ------> COMP1_INP
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN COMP1_MspInit 1 */
+
+  /* USER CODE END COMP1_MspInit 1 */
+  }
+
+}
+
+/**
+* @brief COMP MSP De-Initialization
+* This function freeze the hardware resources used in this example
+* @param hcomp: COMP handle pointer
+* @retval None
+*/
+void HAL_COMP_MspDeInit(COMP_HandleTypeDef* hcomp)
+{
+  if(hcomp->Instance==COMP1)
+  {
+  /* USER CODE BEGIN COMP1_MspDeInit 0 */
+
+  /* USER CODE END COMP1_MspDeInit 0 */
+
+    /**COMP1 GPIO Configuration
+    PB1     ------> COMP1_INP
+    */
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_1);
+
+  /* USER CODE BEGIN COMP1_MspDeInit 1 */
+
+  /* USER CODE END COMP1_MspDeInit 1 */
+  }
+
+}
+
+/**
+* @brief DAC MSP Initialization
+* This function configures the hardware resources used in this example
+* @param hdac: DAC handle pointer
+* @retval None
+*/
+void HAL_DAC_MspInit(DAC_HandleTypeDef* hdac)
+{
+  if(hdac->Instance==DAC3)
+  {
+  /* USER CODE BEGIN DAC3_MspInit 0 */
+
+  /* USER CODE END DAC3_MspInit 0 */
+    /* Peripheral clock enable */
+    __HAL_RCC_DAC3_CLK_ENABLE();
+    /* DAC3 interrupt Init */
+    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  /* USER CODE BEGIN DAC3_MspInit 1 */
+
+  /* USER CODE END DAC3_MspInit 1 */
+  }
+
+}
+
+/**
+* @brief DAC MSP De-Initialization
+* This function freeze the hardware resources used in this example
+* @param hdac: DAC handle pointer
+* @retval None
+*/
+void HAL_DAC_MspDeInit(DAC_HandleTypeDef* hdac)
+{
+  if(hdac->Instance==DAC3)
+  {
+  /* USER CODE BEGIN DAC3_MspDeInit 0 */
+
+  /* USER CODE END DAC3_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_DAC3_CLK_DISABLE();
+
+    /* DAC3 interrupt DeInit */
+  /* USER CODE BEGIN DAC3:TIM6_DAC_IRQn disable */
+    /**
+    * Uncomment the line below to disable the "TIM6_DAC_IRQn" interrupt
+    * Be aware, disabling shared interrupt may affect other IPs
+    */
+    /* HAL_NVIC_DisableIRQ(TIM6_DAC_IRQn); */
+  /* USER CODE END DAC3:TIM6_DAC_IRQn disable */
+
+  /* USER CODE BEGIN DAC3_MspDeInit 1 */
+
+  /* USER CODE END DAC3_MspDeInit 1 */
+  }
+
+}
+
+/**
 * @brief OPAMP MSP Initialization
 * This function configures the hardware resources used in this example
 * @param hopamp: OPAMP handle pointer
@@ -336,6 +450,27 @@ void HAL_OPAMP_MspInit(OPAMP_HandleTypeDef* hopamp)
 
   /* USER CODE END OPAMP2_MspInit 1 */
   }
+  else if(hopamp->Instance==OPAMP3)
+  {
+  /* USER CODE BEGIN OPAMP3_MspInit 0 */
+
+  /* USER CODE END OPAMP3_MspInit 0 */
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    /**OPAMP3 GPIO Configuration
+    PB0     ------> OPAMP3_VINP
+    PB1     ------> OPAMP3_VOUT
+    PB2     ------> OPAMP3_VINM
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN OPAMP3_MspInit 1 */
+
+  /* USER CODE END OPAMP3_MspInit 1 */
+  }
 
 }
 
@@ -380,6 +515,23 @@ void HAL_OPAMP_MspDeInit(OPAMP_HandleTypeDef* hopamp)
   /* USER CODE BEGIN OPAMP2_MspDeInit 1 */
 
   /* USER CODE END OPAMP2_MspDeInit 1 */
+  }
+  else if(hopamp->Instance==OPAMP3)
+  {
+  /* USER CODE BEGIN OPAMP3_MspDeInit 0 */
+
+  /* USER CODE END OPAMP3_MspDeInit 0 */
+
+    /**OPAMP3 GPIO Configuration
+    PB0     ------> OPAMP3_VINP
+    PB1     ------> OPAMP3_VOUT
+    PB2     ------> OPAMP3_VINM
+    */
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2);
+
+  /* USER CODE BEGIN OPAMP3_MspDeInit 1 */
+
+  /* USER CODE END OPAMP3_MspDeInit 1 */
   }
 
 }
@@ -588,7 +740,14 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
     __HAL_RCC_TIM6_CLK_DISABLE();
 
     /* TIM6 interrupt DeInit */
-    HAL_NVIC_DisableIRQ(TIM6_DAC_IRQn);
+  /* USER CODE BEGIN TIM6:TIM6_DAC_IRQn disable */
+    /**
+    * Uncomment the line below to disable the "TIM6_DAC_IRQn" interrupt
+    * Be aware, disabling shared interrupt may affect other IPs
+    */
+    /* HAL_NVIC_DisableIRQ(TIM6_DAC_IRQn); */
+  /* USER CODE END TIM6:TIM6_DAC_IRQn disable */
+
   /* USER CODE BEGIN TIM6_MspDeInit 1 */
 
   /* USER CODE END TIM6_MspDeInit 1 */
