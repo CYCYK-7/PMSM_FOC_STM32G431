@@ -28,6 +28,7 @@
 #include "foc_math.h"
 #include "pi_controller.h"
 #include "svpwm.h"
+#include "vofa_stream.h"
 
 /* USER CODE END Includes */
 
@@ -67,7 +68,7 @@ typedef enum
 
 	FOC_FAULT_OVERCURRENT,
 
-	FOC_FAULT_HALL_INVALID  // Hall电角度无�?
+	FOC_FAULT_HALL_INVALID  // Hall电角度无�??
 
 } FOC_Fault_t;
 
@@ -105,6 +106,7 @@ TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart3_tx;
 
 /* USER CODE BEGIN PV */
 
@@ -117,7 +119,7 @@ UART_HandleTypeDef huart3;
 #define VDC_R_HIGH           75.0f
 #define VDC_R_LOW            3.0f
 
-#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�???
+#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�????
 #define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
 #define CURRENT_A_PER_COUNT  0.02198f
 
@@ -164,25 +166,39 @@ UART_HandleTypeDef huart3;
 
 /* Hall-FOC speed PI outer loop and d/q current PI inner loop: first timed test. */
 #define CURRENT_TEST_AFTER_ALIGN       1U
-#define CURRENT_TEST_DURATION_MS    3000U
+#define CURRENT_TEST_DURATION_MS    9000U  /* 3s first + 3s second + 3s return */
 #define CURRENT_TEST_ZERO_MS         150U
 #define CURRENT_TEST_RAMP_MS         250U
-#define CURRENT_TEST_STEADY_MS      2000U
+#define CURRENT_TEST_STEADY_MS      8000U  /* diagnostics: final 1s */
 #define CURRENT_TEST_IQ_TARGET_A    0.08f
 #define CURRENT_TEST_V_LIMIT_V      1.5f  /* max applied alpha-beta magnitude */
 #define CURRENT_TEST_PI_KP          2.0f  /* initial conservative tuning only */
 #define CURRENT_TEST_PI_KI         40.0f
 #define CURRENT_TEST_PI_LIMIT_V     1.5f  /* each PI output limit */
 
-/* 50 ms averaged trace during RUN, UART only after PWM off. */
-#define CURRENT_TRACE_PERIOD_MS     50U
-#define CURRENT_TRACE_MAX_SAMPLES   70U
+/* 100 ms averaged trace over 9 seconds; UART only after PWM off.
+ * At most ~90 records, buffer has 96 slots for scheduling tolerance. */
+#define CURRENT_TRACE_PERIOD_MS    100U
+#define CURRENT_TRACE_MAX_SAMPLES   96U
 
 /* First Hall speed outer loop (mechanical rpm and ampere units).
  * Conservative STARTUP SETTINGS, not final motor-specific PI tuning.
  * SPEED_LOOP_PI_KP unit: A/rpm; SPEED_LOOP_PI_KI unit: A/(rpm*s).
  * Output [0,0.08 A] deliberately permits CW torque only in this test. */
-#define SPEED_LOOP_TARGET_RPM        150.0f
+/* Three-stage speed request: 0->100, 100->150, 150->100 rpm.
+ * Positive-only Iq means return to 100 rpm uses natural deceleration
+ * (zero/reduced torque), NOT active reverse torque / braking. */
+#define SPEED_DYN_FIRST_RPM         100.0f
+#define SPEED_DYN_SECOND_RPM        150.0f
+#define SPEED_DYN_FINAL_RPM         100.0f
+#define SPEED_DYN_UP_START_MS       3000U
+#define SPEED_DYN_UP_RAMP_MS         500U
+#define SPEED_DYN_DOWN_START_MS     6000U
+#define SPEED_DYN_DOWN_RAMP_MS       500U
+/* Stable comparison windows: final 1s of each 3s phase. */
+#define SPEED_DYN_PHASE0_STATS_MS   2000U
+#define SPEED_DYN_PHASE1_STATS_MS   5000U
+#define SPEED_DYN_PHASE2_STATS_MS   8000U
 #define SPEED_LOOP_PERIOD_MS          10U
 #define SPEED_LOOP_ZERO_MS           150U
 #define SPEED_LOOP_RAMP_MS          1000U
@@ -271,7 +287,7 @@ volatile uint32_t pwm_ccr_u = 0;
 volatile uint32_t pwm_ccr_v = 0;
 volatile uint32_t pwm_ccr_w = 0;
 
-float v_alpha_cmd = 0.0f; //�???终�?�给SVPWM的电�???
+float v_alpha_cmd = 0.0f; //�????终�?�给SVPWM的电�????
 float v_beta_cmd  = 0.0f;
 
 volatile uint8_t foc_enable = 0;//目前没有接入真正的角度，还没有真正的电机闭环
@@ -319,11 +335,11 @@ volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
 volatile float hall_speed_rpm = 0.0f;
 volatile float hall_omega_e = 0.0f;
 volatile float hall_omega_m = 0.0f;
-volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�?
+volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�??
 volatile uint32_t hall_last_edge_ms = 0;
 
 //theta
-volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�?0~2π
+volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�??0~2π
 volatile uint8_t hall_angle_valid = 0;
 
 volatile uint32_t hall_angle_update_count = 0;
@@ -477,6 +493,12 @@ volatile uint32_t speed_steady_valid_ticks = 0U;
 volatile float speed_steady_rpm_sum = 0.0f;
 volatile uint32_t speed_loop_update_count = 0U;
 static uint32_t speed_loop_next_ms = SPEED_LOOP_PERIOD_MS;
+/* Phase 0: first 100rpm; phase 1: 150rpm; phase 2: return 100rpm.
+ * Speed averages use only VALID filtered Hall feedback in each final 1s. */
+volatile uint8_t speed_profile_phase = 0U;
+static float speed_phase_sum_rpm[3] = {0.0f, 0.0f, 0.0f};
+static float speed_phase_abs_error_sum_rpm[3] = {0.0f, 0.0f, 0.0f};
+volatile uint32_t speed_phase_valid_ticks[3] = {0U, 0U, 0U};
 
 /* One record represents a 50 ms block of approximately 1000 ADC control steps.
  * id/iq/ref/voltage/integrator are BLOCK MEANS; iq_min/iq_max show spread.
@@ -502,6 +524,7 @@ typedef struct
     float speed_ref_rpm;       /* 50ms end-of-block speed setpoint */
     float speed_feedback_rpm;  /* filtered Hall feedback; end-of-block */
     uint8_t speed_feedback_valid;
+    uint8_t speed_profile_phase;  /* 0/1/2: three speed setpoint stages */
 } CurrentTraceSample_t;
 
 volatile CurrentTraceSample_t current_trace[CURRENT_TRACE_MAX_SAMPLES];
@@ -549,7 +572,7 @@ static void FOC_SetNeutralPWM(void);
 static void FOC_StateManager(void);
 static void FOC_CheckStartButton(void);
 static void FOC_PWM_Enable(void);
-static void FOC_PWM_Disable(void); //只关闭三�???
+static void FOC_PWM_Disable(void); //只关闭三�????
 static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
 static void FOC_TriggerFault(FOC_Fault_t fault_code);
 static void FOC_CheckVdcProtection(void);
@@ -1320,7 +1343,7 @@ static void FOC_CheckVdcProtection(void)
 {
     /* ==========================================
      * Over-voltage protection
-     * READY �??? RUN 都可以检测过�???
+     * READY �???? RUN 都可以检测过�????
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
@@ -1357,7 +1380,7 @@ static void FOC_CheckVdcProtection(void)
 
     /* ==========================================
      * Under-voltage protection
-     * 当前只在 RUN 中检�???
+     * 当前只在 RUN 中检�????
      * ========================================== */
     if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
         (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
@@ -1508,7 +1531,7 @@ static int8_t Hall_StateToSector(uint8_t state)
 static void Hall_UpdateDirection(int8_t new_sector)
 {
     /* Invalid Hall state */
-    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�??
+    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�???
     	                   // 但是在中断中hall_sector = Hall_StateToSector(hall_state);
     {
         hall_direction = HALL_DIR_UNKNOWN;
@@ -1517,7 +1540,7 @@ static void Hall_UpdateDirection(int8_t new_sector)
 
 
     /* First valid Hall state */
-    if (hall_prev_sector < 0)  // 当刚�??机没转时候，程序等于没存前一次的sector的�?�，�??以到定义，为�??么定义为-1呢，
+    if (hall_prev_sector < 0)  // 当刚�???机没转时候，程序等于没存前一次的sector的�?�，�???以到定义，为�???么定义为-1呢，
     	                       // 这是因为，为了方便将第一次采集到的�?�幅值给hall_prev_sector
     {
         hall_prev_sector = new_sector;
@@ -1749,7 +1772,7 @@ static void Hall_CheckTimeout(void)
 
         /*
          * Restart direction detection
-         * from next Hall transition.
+         * from next Hall transition. "St=
          */
         hall_prev_sector = -1;
         hall_pred_ready = 0U;
@@ -1760,7 +1783,7 @@ static void Hall_CheckTimeout(void)
     }
 }
 
-static float WrapAngle0To2Pi(float angle)  //角度归一�?
+static float WrapAngle0To2Pi(float angle)  //角度归一�??
 {
     while (angle >= TWO_PI_F)
     {
@@ -1990,6 +2013,13 @@ static void FOC_CurrentTest_Begin(void)
     speed_steady_rpm_sum = 0.0f;
     speed_loop_update_count = 0U;
     speed_loop_next_ms = SPEED_LOOP_PERIOD_MS;
+    speed_profile_phase = 0U;
+    for (uint32_t i = 0U; i < 3U; ++i)
+    {
+        speed_phase_sum_rpm[i] = 0.0f;
+        speed_phase_abs_error_sum_rpm[i] = 0.0f;
+        speed_phase_valid_ticks[i] = 0U;
+    }
     hall_pred_edge_err_count = 0U;
     hall_pred_old_err_deg_last = 0.0f;
     hall_pred_new_err_deg_last = 0.0f;
@@ -2081,15 +2111,33 @@ static void FOC_SpeedLoop_Update(uint32_t elapsed_ms)
         }
     }
 
+    /* Generate the speed profile inside the existing 100Hz outer loop.
+     * No new timer, no UART and no changes to the 20kHz current controller. */
     if (elapsed_ms < SPEED_LOOP_ZERO_MS)
         target = 0.0f;
     else if (elapsed_ms < SPEED_LOOP_ZERO_MS + SPEED_LOOP_RAMP_MS)
-        target = SPEED_LOOP_TARGET_RPM *
+        target = SPEED_DYN_FIRST_RPM *
                  (float)(elapsed_ms - SPEED_LOOP_ZERO_MS) /
                  (float)SPEED_LOOP_RAMP_MS;
+    else if (elapsed_ms < SPEED_DYN_UP_START_MS)
+        target = SPEED_DYN_FIRST_RPM;
+    else if (elapsed_ms < SPEED_DYN_UP_START_MS + SPEED_DYN_UP_RAMP_MS)
+        target = SPEED_DYN_FIRST_RPM +
+                 (SPEED_DYN_SECOND_RPM - SPEED_DYN_FIRST_RPM) *
+                 (float)(elapsed_ms - SPEED_DYN_UP_START_MS) /
+                 (float)SPEED_DYN_UP_RAMP_MS;
+    else if (elapsed_ms < SPEED_DYN_DOWN_START_MS)
+        target = SPEED_DYN_SECOND_RPM;
+    else if (elapsed_ms < SPEED_DYN_DOWN_START_MS + SPEED_DYN_DOWN_RAMP_MS)
+        target = SPEED_DYN_SECOND_RPM +
+                 (SPEED_DYN_FINAL_RPM - SPEED_DYN_SECOND_RPM) *
+                 (float)(elapsed_ms - SPEED_DYN_DOWN_START_MS) /
+                 (float)SPEED_DYN_DOWN_RAMP_MS;
     else
-        target = SPEED_LOOP_TARGET_RPM;
+        target = SPEED_DYN_FINAL_RPM;
 
+    speed_profile_phase = (elapsed_ms < SPEED_DYN_UP_START_MS) ? 0U :
+                          ((elapsed_ms < SPEED_DYN_DOWN_START_MS) ? 1U : 2U);
     speed_ref_rpm = target;
     fb = speed_feedback_rpm;
     if (target <= 0.0f)
@@ -2115,6 +2163,37 @@ static void FOC_SpeedLoop_Update(uint32_t elapsed_ms)
     {
         speed_steady_rpm_sum += fb;
         speed_steady_valid_ticks++;
+    }
+
+    /* Final 1s of each stage, excluding both acceleration ramps. */
+    if (speed_feedback_valid != 0U)
+    {
+        int8_t phase_idx = -1;
+        float phase_target = 0.0f;
+        if ((elapsed_ms >= SPEED_DYN_PHASE0_STATS_MS) &&
+            (elapsed_ms < SPEED_DYN_UP_START_MS))
+        {
+            phase_idx = 0;
+            phase_target = SPEED_DYN_FIRST_RPM;
+        }
+        else if ((elapsed_ms >= SPEED_DYN_PHASE1_STATS_MS) &&
+                 (elapsed_ms < SPEED_DYN_DOWN_START_MS))
+        {
+            phase_idx = 1;
+            phase_target = SPEED_DYN_SECOND_RPM;
+        }
+        else if (elapsed_ms >= SPEED_DYN_PHASE2_STATS_MS)
+        {
+            phase_idx = 2;
+            phase_target = SPEED_DYN_FINAL_RPM;
+        }
+        if (phase_idx >= 0)
+        {
+            uint8_t i = (uint8_t)phase_idx;
+            speed_phase_sum_rpm[i] += fb;
+            speed_phase_abs_error_sum_rpm[i] += fabsf(phase_target - fb);
+            speed_phase_valid_ticks[i]++;
+        }
     }
 }
 
@@ -2168,6 +2247,7 @@ static void FOC_CurrentTrace_Collect(uint32_t elapsed_ms)
         current_trace[idx].speed_ref_rpm = speed_ref_rpm;
         current_trace[idx].speed_feedback_rpm = speed_feedback_rpm;
         current_trace[idx].speed_feedback_valid = speed_feedback_valid;
+        current_trace[idx].speed_profile_phase = speed_profile_phase;
         current_trace_count = idx + 1U; /* Publish ONLY when record is complete. */
     }
     else
@@ -2197,7 +2277,7 @@ static void FOC_CurrentTrace_DumpUART(void)
 
     const char *marker = "TRACE_BEGIN\r\n";
     const char *header =
-        "t_ms,iq_ref,id_avg,iq_avg,iq_min,iq_max,vd_avg,vq_avg,iq_integ,hall_rpm,theta_rad,hall_sector,hall_speed_valid,theta_old_rad,edge_old_err_deg,edge_new_err_deg,speed_ref_rpm,speed_fb_rpm,speed_fb_valid\r\n";
+        "t_ms,iq_ref,id_avg,iq_avg,iq_min,iq_max,vd_avg,vq_avg,iq_integ,hall_rpm,theta_rad,hall_sector,hall_speed_valid,theta_old_rad,edge_old_err_deg,edge_new_err_deg,speed_ref_rpm,speed_fb_rpm,speed_fb_valid,speed_phase\r\n";
     HAL_UART_Transmit(&huart3, (uint8_t *)marker,
                       (uint16_t)strlen(marker), HAL_MAX_DELAY);
     HAL_UART_Transmit(&huart3, (uint8_t *)header,
@@ -2207,7 +2287,7 @@ static void FOC_CurrentTrace_DumpUART(void)
         /* Snapshot once: the PWM is already off and no ISR changes this array. */
         const volatile CurrentTraceSample_t *p = &current_trace[j];
         len = snprintf(line, sizeof(line),
-                       "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.4f,%d,%u,%.4f,%.2f,%.2f,%.2f,%.2f,%u\r\n",
+                       "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.4f,%d,%u,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u\r\n",
                        (unsigned)p->t_ms,
                        (double)p->iq_ref_a,
                        (double)p->id_avg_a,
@@ -2226,7 +2306,8 @@ static void FOC_CurrentTrace_DumpUART(void)
                        (double)p->edge_new_err_deg,
                        (double)p->speed_ref_rpm,
                        (double)p->speed_feedback_rpm,
-                       (unsigned)p->speed_feedback_valid);
+                       (unsigned)p->speed_feedback_valid,
+                       (unsigned)p->speed_profile_phase);
         if ((len > 0) && (len < (int)sizeof(line)))
             HAL_UART_Transmit(&huart3, (uint8_t *)line,
                               (uint16_t)len, HAL_MAX_DELAY);
@@ -2238,7 +2319,7 @@ static void FOC_CurrentTrace_DumpUART(void)
                           (uint16_t)len, HAL_MAX_DELAY);
     len = snprintf(line, sizeof(line),
                    "SPEED_SUMMARY,ref=%.1f,avg=%.2f,peak=%.2f,iq_ref=%.4f,valid_ticks=%lu,updates=%lu,hall_edges=%lu,fault=%u\r\n",
-                   (double)SPEED_LOOP_TARGET_RPM,
+                   (double)SPEED_DYN_FINAL_RPM,
                    (double)((speed_steady_valid_ticks > 0U) ?
                             speed_steady_rpm_sum / (float)speed_steady_valid_ticks : 0.0f),
                    (double)speed_peak_rpm,
@@ -2250,6 +2331,22 @@ static void FOC_CurrentTrace_DumpUART(void)
     if ((len > 0) && (len < (int)sizeof(line)))
         HAL_UART_Transmit(&huart3, (uint8_t *)line,
                           (uint16_t)len, HAL_MAX_DELAY);
+    /* 3 comparable last-1-second stage metrics, each from 100Hz samples. */
+    for (uint32_t i = 0U; i < 3U; ++i)
+    {
+        float stage_target = (i == 1U) ? SPEED_DYN_SECOND_RPM :
+                             ((i == 0U) ? SPEED_DYN_FIRST_RPM : SPEED_DYN_FINAL_RPM);
+        uint32_t n = speed_phase_valid_ticks[i];
+        float average = (n != 0U) ? (speed_phase_sum_rpm[i] / (float)n) : 0.0f;
+        float mae = (n != 0U) ? (speed_phase_abs_error_sum_rpm[i] / (float)n) : 0.0f;
+        len = snprintf(line, sizeof(line),
+                       "SPEED_PHASE,phase=%lu,ref=%.1f,avg=%.2f,mae=%.2f,valid_ticks=%lu\r\n",
+                       (unsigned long)i, (double)stage_target,
+                       (double)average, (double)mae, (unsigned long)n);
+        if ((len > 0) && (len < (int)sizeof(line)))
+            HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                              (uint16_t)len, HAL_MAX_DELAY);
+    }
     /* Last and max Hall-boundary residuals are measured on complete sectors. */
     if (hall_pred_edge_err_count > 0U)
     {
@@ -2539,10 +2636,10 @@ int main(void)
 
   /*
    * TIM1 CH1/2/3:
-   * 已完成PWM配置，但暂不启动三相功率输出�?
+   * 已完成PWM配置，但暂不启动三相功率输出�??
    *
    * TIM1 CH4:
-   * 仅用于触发ADC同步电流采样�?
+   * 仅用于触发ADC同步电流采样�??
    */
   FOC_PWM_Disable();
 
@@ -2591,6 +2688,26 @@ int main(void)
 	  /* Hall timeout monitoring */
 	  Hall_CheckTimeout();
 
+
+
+
+	  /* Only in foreground, not in the 20kHz ADC interrupt. */
+	  static uint32_t last_vofa_ms = 0U;
+
+	  uint32_t now_ms = HAL_GetTick();
+
+	  if ((uint32_t)(now_ms - last_vofa_ms) >= 10U)
+	  {
+	      last_vofa_ms = now_ms;
+
+	      (void)VOFA_Stream_TrySend(
+	    		    speed_ref_rpm,
+	    		    speed_feedback_rpm,
+	    		    iq_ref,
+	    		    i_dq.q,
+	    		    vdc_bus);
+	  }
+
       /* Print data only AFTER the completed current test has disabled PWM.
        * Never perform UART output from the 20 kHz ADC interrupt. */
       if ((current_trace_dump_pending != 0U) &&
@@ -2598,7 +2715,7 @@ int main(void)
            (foc_state == FOC_STATE_FAULT)))
       {
           current_trace_dump_pending = 0U;
-          FOC_CurrentTrace_DumpUART();
+          // FOC_CurrentTrace_DumpUART();  // VOFA模式下暂时禁用CSV串口输出
       }
 
 
@@ -2606,7 +2723,7 @@ int main(void)
 	  {
 	      uint8_t state;
 	      uint32_t capture;
-	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�??
+	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�???
 
 	      hall_uart_pending = 0;
 
@@ -2669,12 +2786,12 @@ int main(void)
 
 	  /* Hall electrical angle offset test: UART output */
 	  /* Hall FOC electrical angle UART test */
-	  if ((foc_state != FOC_STATE_ALIGN_ACTIVE) &&
+      /*  if ((foc_state != FOC_STATE_ALIGN_ACTIVE) &&
           ((uint32_t)(HAL_GetTick() - angle_uart_last_ms) >= 100U))
 	  {
 	      angle_uart_last_ms = HAL_GetTick();
 
-	      /* Latest open-loop debug values persist after the automatic stop. */
+	      //Latest open-loop debug values persist after the automatic stop.
 	      int len = snprintf(
 	          tx_buffer,
 	          sizeof(tx_buffer),
@@ -2697,7 +2814,7 @@ int main(void)
 	              HAL_MAX_DELAY
 	          );
 	      }
-	  }
+	  }*/
 
   }
   /* USER CODE END 3 */
@@ -3202,6 +3319,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -3310,7 +3430,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
         current_sample_ready = 0;
 
-		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �??? FAULT 状�?�需要知�??? Vdc
+		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �???? FAULT 状�?�需要知�???? Vdc
 
         adc_injected_count++;
 
@@ -3318,7 +3438,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         FOC_CheckVdcProtection();
 
 
-        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�???1）中的FOC_StateManager();执行之后
+        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�????1）中的FOC_StateManager();执行之后
         {
             return;
         }
@@ -3350,14 +3470,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             }
             /*
              * 很重要：
-             * CALIBRATION 状�?�做到这里就结束本次ADC回调�???
-             * 不继续算电流、Park、PI�???
+             * CALIBRATION 状�?�做到这里就结束本次ADC回调�????
+             * 不继续算电流、Park、PI�????
              */
             return;
         }
 
         /* ==================================================
-         * 2. INIT / FAULT 状�?�直接�??�???
+         * 2. INIT / FAULT 状�?�直接�??�????
          * ================================================== */
         if ((foc_state == FOC_STATE_INIT) ||
             (foc_state == FOC_STATE_FAULT))
@@ -3367,8 +3487,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         /* ---------- Current calculation ---------- */
         /* ==================================================
-         * 3. READY �??? RUN 都允许走到这�???
-         *    �???以继续计算实际电�???
+         * 3. READY �???? RUN 都允许走到这�????
+         *    �????以继续计算实际电�????
          * ================================================== */
 
         //standard FOC current direction e=i^*-i
@@ -3444,10 +3564,10 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		/* Update real Hall interpolated angle */
 		/*
 		 * 不要只在 Hall 边沿中断里运行此函数
-		 *  因为如果只在 Hall ISR 里算�?
-		 *  �?个Hall边沿 �? 算一次角�?
-		 *  直到下一个Hall边沿 �? 才再更新
-		 *  这仍然不是连续角度，�?以放�?20 kHz ADC 同步控制 ISR 中�??
+		 *  因为如果只在 Hall ISR 里算�??
+		 *  �??个Hall边沿 �?? 算一次角�??
+		 *  直到下一个Hall边沿 �?? 才再更新
+		 *  这仍然不是连续角度，�??以放�??20 kHz ADC 同步控制 ISR 中�??
 		 */
 		Hall_UpdateElectricalAngle();
 
@@ -3460,7 +3580,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		}
 
 
-		/* RUN状�?�下�?查Hall角度有效�? */
+		/* RUN状�?�下�??查Hall角度有效�?? */
 		if (((foc_state == FOC_STATE_RUN) ||
              (foc_state == FOC_STATE_ALIGN_ACTIVE)) &&
             (hall_angle_valid == 0U))

@@ -1,0 +1,52 @@
+/*
+ * vofa_stream.c
+ *
+ *  Created on: 2026年10月21日
+ *      Author: CYC.YK
+ */
+
+#include "vofa_stream.h"
+#include "main.h"
+#include <string.h>
+
+/* USART3 exists in the current FOC firmware; peripheral setup remains in
+ * CubeMX generated initialization. TX DMA needs its own unused channel.
+ * Do NOT copy the vendor DMA1_Channel1 allocation: that is ADC1 in FOC. */
+extern UART_HandleTypeDef huart3;
+
+/* JustFloat: N little-endian float32 + 00 00 80 7F frame footer. */
+#define VOFA_CHANNEL_COUNT    5U
+#define VOFA_FRAME_BYTES      (4U * VOFA_CHANNEL_COUNT + 4U)
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(sizeof(float) == 4U, "JustFloat requires IEEE754 float32 size");
+#endif
+
+/* STATIC: the DMA controller reads it after HAL_UART_Transmit_DMA returns. */
+static uint8_t vofa_tx_frame[VOFA_FRAME_BYTES];
+
+uint8_t VOFA_Stream_TrySend(float speed_ref_rpm,
+                            float speed_actual_rpm,
+                            float iq_ref_a,
+                            float iq_actual_a,
+                            float vdc_bus_v)
+{
+    const float values[VOFA_CHANNEL_COUNT] = {
+        speed_ref_rpm, speed_actual_rpm, iq_ref_a, iq_actual_a, vdc_bus_v
+    };
+
+    /* No wait loops; skip frames if another transfer is still underway. */
+    if (huart3.gState != HAL_UART_STATE_READY)
+        return 0U;
+
+    memcpy(vofa_tx_frame, values, sizeof(values));
+    vofa_tx_frame[VOFA_FRAME_BYTES - 4U] = 0x00U;
+    vofa_tx_frame[VOFA_FRAME_BYTES - 3U] = 0x00U;
+    vofa_tx_frame[VOFA_FRAME_BYTES - 2U] = 0x80U;
+    vofa_tx_frame[VOFA_FRAME_BYTES - 1U] = 0x7FU;
+
+    return (HAL_UART_Transmit_DMA(&huart3, vofa_tx_frame,
+                                  (uint16_t)sizeof(vofa_tx_frame)) == HAL_OK)
+        ? 1U : 0U;
+}
+
