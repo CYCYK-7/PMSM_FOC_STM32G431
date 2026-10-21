@@ -1,0 +1,3845 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+#include <stdio.h>
+#include <string.h>  /* strlen for post-run UART CSV output */
+#include <math.h>  /* atan2f/sinf/cosf for circular Hall-offset averaging */
+#include "foc_math.h"
+#include "pi_controller.h"
+#include "svpwm.h"
+#include "vofa_stream.h"
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+typedef enum
+{
+    FOC_STATE_INIT = 0,
+
+    FOC_STATE_CALIBRATION,
+
+    FOC_STATE_READY,
+
+	FOC_STATE_ALIGN_TEST,  // 不�?�电对齐测试
+
+	FOC_STATE_BOOTSTRAP_PREPARE,
+	FOC_STATE_BOOTSTRAP_CHARGE,
+
+    FOC_STATE_ALIGN_PREPARE,
+    FOC_STATE_ALIGN_ACTIVE,
+    FOC_STATE_OPEN_LOOP,  /* rotating voltage vector; no Hall offset required */
+
+    FOC_STATE_RUN,
+
+    FOC_STATE_FAULT
+
+} FOC_State_t;
+
+typedef enum
+{
+    FOC_FAULT_NONE = 0,
+
+    FOC_FAULT_VDC_UNDERVOLTAGE,  //欠压
+
+    FOC_FAULT_VDC_OVERVOLTAGE, //过压
+
+	FOC_FAULT_OVERCURRENT,
+
+	FOC_FAULT_HALL_INVALID  // Hall电角度无�??
+
+} FOC_Fault_t;
+
+typedef enum
+{
+    HALL_DIR_UNKNOWN = 0,
+    HALL_DIR_CW      = 1,
+    HALL_DIR_CCW     = -1
+
+} Hall_Direction_t;
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
+DMA_HandleTypeDef hdma_adc1;
+DMA_HandleTypeDef hdma_adc2;
+
+OPAMP_HandleTypeDef hopamp1;
+OPAMP_HandleTypeDef hopamp2;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim4;
+TIM_HandleTypeDef htim6;
+
+UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart3_tx;
+
+/* USER CODE BEGIN PV */
+
+#define CURRENT_OFFSET_SAMPLES  1000U
+#define CURRENT_LOOP_TS  0.00005f // 1/20khz
+
+#define ADC_FULL_SCALE       4095.0f
+#define ADC_VREF             3.3f
+
+#define VDC_R_HIGH           75.0f
+#define VDC_R_LOW            3.0f
+
+#define VDC_DIVIDER_RATIO    ((VDC_R_HIGH + VDC_R_LOW) / VDC_R_LOW) // Vdc分频�????
+#define VDC_VOLTS_PER_COUNT  ((ADC_VREF * VDC_DIVIDER_RATIO) / ADC_FULL_SCALE) //Vdc每count的volts
+#define CURRENT_A_PER_COUNT  0.02198f
+
+#define VDC_FAULT_CONFIRM_SAMPLES  100 // 100*50us = 50ms
+
+#define MOTOR_POLE_PAIRS       2.0f
+#define HALL_TIMER_TICK_S      0.00001f // arr 65535 psc 1699 10us
+#define PI_F                   3.141592654f
+#define HALL_STOP_TIMEOUT_MS 500U   // max time is 65536*10us = 655.36ms
+#define HALL_SECTOR_ANGLE_RAD   (PI_F / 3.0f)
+#define TWO_PI_F                (2.0f * PI_F)
+
+#define CURRENT_OC_TRIP_A            0.25f
+#define CURRENT_OC_CONFIRM_SAMPLES   2U
+
+#define BOOTSTRAP_PREPARE_MS  2U
+#define BOOTSTRAP_CHARGE_MS   10U
+
+/* Real alignment: disabled by default until power-stage safeguards are verified. */
+#define ALIGN_POWER_ALLOWED   1U
+#define ALIGN_PREPARE_MS      2U
+#define ALIGN_ACTIVE_MS       250U   /* previously observed real motor response */
+#define ALIGN_V_ALPHA_V       1.0f
+
+/* First low-speed open-loop attempt: independent from Hall electrical offset. */
+#define OPEN_LOOP_AFTER_ALIGN       0U
+#define OPEN_LOOP_VOLTAGE_V         1.0f
+#define OPEN_LOOP_TARGET_RPM       15.0f   /* mechanical rpm, NOT electrical rpm */
+#define OPEN_LOOP_RAMP_MS           1000U
+#define OPEN_LOOP_DURATION_MS       3000U  /* includes the 1-second acceleration */
+/* 20 kHz ADC callback -> 20 update ticks per ms. */
+#define OPEN_LOOP_RAMP_TICKS        (OPEN_LOOP_RAMP_MS * 20U)
+
+/* Hall offset experiment: two separate SW3 starts, forward then reverse.
+ * Keep the previously validated 1 V, 15 rpm, 3-second drive settings. */
+#define HALL_CALIB_MODE                  0U
+#define HALL_CALIB_MIN_SAMPLES           4U
+#define HALL_CALIB_MAX_SAMPLES          10U
+#define HALL_CALIB_MAX_REJECTS           2U
+#define HALL_CALIB_MIN_EDGE_MS          80U
+#define HALL_CALIB_MAX_DIR_DIFF_RAD     (PI_F / 3.0f)
+/* Small grace period for main-loop state transition; TIM6 still imposes a cap. */
+#define ALIGN_TO_OPENLOOP_GRACE_MS  20U
+
+/* Hall-FOC speed PI outer loop and d/q current PI inner loop: first timed test. */
+#define CURRENT_TEST_AFTER_ALIGN       1U
+#define CURRENT_TEST_DURATION_MS    9000U  /* 3s first + 3s second + 3s return */
+#define CURRENT_TEST_ZERO_MS         150U
+#define CURRENT_TEST_RAMP_MS         250U
+#define CURRENT_TEST_STEADY_MS      8000U  /* diagnostics: final 1s */
+#define CURRENT_TEST_IQ_TARGET_A    0.08f
+#define CURRENT_TEST_V_LIMIT_V      1.5f  /* max applied alpha-beta magnitude */
+#define CURRENT_TEST_PI_KP          2.0f  /* initial conservative tuning only */
+#define CURRENT_TEST_PI_KI         40.0f
+#define CURRENT_TEST_PI_LIMIT_V     1.5f  /* each PI output limit */
+
+/* 100 ms averaged trace over 9 seconds; UART only after PWM off.
+ * At most ~90 records, buffer has 96 slots for scheduling tolerance. */
+#define CURRENT_TRACE_PERIOD_MS    100U
+#define CURRENT_TRACE_MAX_SAMPLES   96U
+
+/* First Hall speed outer loop (mechanical rpm and ampere units).
+ * Conservative STARTUP SETTINGS, not final motor-specific PI tuning.
+ * SPEED_LOOP_PI_KP unit: A/rpm; SPEED_LOOP_PI_KI unit: A/(rpm*s).
+ * Output [0,0.08 A] deliberately permits CW torque only in this test. */
+/* Three-stage speed request: 0->100, 100->150, 150->100 rpm.
+ * Positive-only Iq means return to 100 rpm uses natural deceleration
+ * (zero/reduced torque), NOT active reverse torque / braking. */
+#define SPEED_DYN_FIRST_RPM         100.0f
+#define SPEED_DYN_SECOND_RPM        150.0f
+#define SPEED_DYN_FINAL_RPM         100.0f
+#define SPEED_DYN_UP_START_MS       3000U
+#define SPEED_DYN_UP_RAMP_MS         500U
+#define SPEED_DYN_DOWN_START_MS     6000U
+#define SPEED_DYN_DOWN_RAMP_MS       500U
+/* Stable comparison windows: final 1s of each 3s phase. */
+#define SPEED_DYN_PHASE0_STATS_MS   2000U
+#define SPEED_DYN_PHASE1_STATS_MS   5000U
+#define SPEED_DYN_PHASE2_STATS_MS   8000U
+#define SPEED_LOOP_PERIOD_MS          10U
+#define SPEED_LOOP_ZERO_MS           150U
+#define SPEED_LOOP_RAMP_MS          1000U
+#define SPEED_LOOP_PI_KP          0.0008f
+#define SPEED_LOOP_PI_KI          0.0006f
+#define SPEED_LOOP_IQ_MAX_A         0.08f
+#define SPEED_LOOP_FILTER_ALPHA     0.25f
+/* Ignore Hall speed inherited from alignment: require two RUN Hall edges. */
+#define SPEED_LOOP_STALE_MS          250U
+#define SPEED_LOOP_NO_EDGE_MS       1800U
+
+/* Hall angle A/B test: 1=new acceleration-compensated predictor; 0=legacy. */
+#define HALL_ANGLE_PREDICT_ENABLE      0U
+#define HALL_PRED_MAX_ACCEL_E         180.0f  /* rad/s^2, electrical */
+#define HALL_PRED_MIN_INTERVAL_S      0.005f
+#define HALL_PRED_MAX_INTERVAL_S      0.600f
+#define HALL_PRED_MIN_SPEED_FACTOR    0.50f
+#define HALL_PRED_MAX_SPEED_FACTOR    1.80f
+
+
+volatile uint8_t current_oc_counter = 0;
+
+
+
+ //Private Variables
+// uint32_t counter = 0;  //计数变量
+
+
+volatile uint32_t timer_counter = 0;
+volatile uint8_t uart_send_flag = 0;
+
+uint32_t seconds_counter = 0;
+char tx_buffer[100];    //准备发给电脑的一小块字符缓冲qu
+
+
+
+volatile uint16_t iu_raw_sync = 0;
+volatile uint16_t iv_raw_sync = 0;
+
+volatile uint32_t iu_offset_sum = 0;
+volatile uint32_t iv_offset_sum = 0;
+
+volatile uint16_t iu_offset_adc = 2048;
+volatile uint16_t iv_offset_adc = 2048;
+
+volatile int32_t iu_adc_delta = 0;
+volatile int32_t iv_adc_delta = 0;
+
+volatile int32_t iu_ma = 0;
+volatile int32_t iv_ma = 0;
+
+
+volatile uint32_t current_offset_count = 0;
+volatile uint32_t adc_injected_count = 0; // the number of times ADC synchronous sampling occurs
+
+volatile uint8_t current_offset_done = 0;
+
+volatile uint8_t current_sample_ready = 0;
+
+//-----------------------------------------------
+volatile float iu_a = 0.0f;
+volatile float iv_a = 0.0f;
+volatile float iw_a = 0.0f;
+
+AlphaBeta_t i_ab = {0};
+
+DQ_t i_dq = {0};
+volatile float theta_e_test = 0.0f; //test angle
+volatile float theta_e_step = 0.0f;
+
+
+AlphaBeta_t v_ab = {0}; //InvPark原始输出
+volatile float vd_cmd = 0.0f;
+volatile float vq_cmd = 0.0f;
+
+
+PI_Controller_t pi_id;
+PI_Controller_t pi_iq;
+PI_Controller_t pi_speed;
+volatile float id_ref = 0.0f;
+volatile float iq_ref = 0.0f;
+
+
+SVPWM_Output_t svpwm_out = {0};
+volatile uint32_t pwm_ccr_u = 0;
+volatile uint32_t pwm_ccr_v = 0;
+volatile uint32_t pwm_ccr_w = 0;
+
+float v_alpha_cmd = 0.0f; //�????终�?�给SVPWM的电�????
+float v_beta_cmd  = 0.0f;
+
+volatile uint8_t foc_enable = 0;//目前没有接入真正的角度，还没有真正的电机闭环
+
+
+volatile uint16_t vdc_adc_raw = 0;
+volatile float vdc_bus = 0.0f;
+
+volatile FOC_State_t foc_state = FOC_STATE_INIT;
+volatile uint8_t foc_start_request = 0;
+volatile uint8_t foc_stop_request  = 0;
+volatile uint8_t foc_fault_request = 0;
+volatile FOC_Fault_t foc_fault_code = FOC_FAULT_NONE;
+volatile uint8_t foc_fault_reset_request = 0;
+
+volatile float vdc_uv_trip = 15.0f; // test value
+volatile float vdc_ov_trip = 30.0f;
+
+volatile uint16_t vdc_uv_counter = 0;
+volatile uint16_t vdc_ov_counter = 0;
+
+//-----------HALL-------------------
+volatile uint8_t hall_a = 0;
+volatile uint8_t hall_b = 0;
+volatile uint8_t hall_c = 0;
+
+volatile uint8_t hall_state = 0;
+
+volatile uint32_t hall_edge_count = 0;
+volatile uint32_t hall_capture = 0;
+
+//hall uart value begin
+volatile uint8_t hall_uart_pending = 0;
+volatile uint8_t hall_report_state = 0;
+volatile uint32_t hall_report_capture = 0;
+volatile uint32_t hall_report_edge_count = 0;
+//hall uart value end
+
+// direction
+volatile int8_t hall_sector = -1;
+volatile int8_t hall_prev_sector = -1;
+volatile Hall_Direction_t hall_direction = HALL_DIR_UNKNOWN;
+
+// speed
+volatile float hall_speed_rpm = 0.0f;
+volatile float hall_omega_e = 0.0f;
+volatile float hall_omega_m = 0.0f;
+volatile uint8_t hall_speed_valid = 0; // 1 表示当前speed可信 0表示不可�??
+volatile uint32_t hall_last_edge_ms = 0;
+
+//theta
+volatile float hall_theta_rel = 0.0f;  //Hall估计出来的连续相对电角度�??0~2π
+volatile uint8_t hall_angle_valid = 0;
+
+volatile uint32_t hall_angle_update_count = 0;
+
+/* For diagnosis: legacy Hall angle is calculated in parallel, but does NOT
+ * participate in Park/InvPark when HALL_ANGLE_PREDICT_ENABLE == 1. */
+volatile float hall_theta_legacy_rel = 0.0f;
+volatile float hall_pred_omega_edge_e = 0.0f;
+volatile float hall_pred_accel_e = 0.0f;
+volatile uint8_t hall_pred_ready = 0U;
+static float hall_pred_prev_interval_s = 0.0f;
+static uint8_t hall_pred_have_prev_interval = 0U;
+static Hall_Direction_t hall_pred_direction = HALL_DIR_UNKNOWN;
+
+/* Electrical-sector boundary prediction error: computed at TIM4 Hall edges.
+ * It is NOT the 10 ms difference between two serial snapshots. */
+volatile uint32_t hall_pred_edge_err_count = 0U;
+volatile float hall_pred_old_err_deg_last = 0.0f;
+volatile float hall_pred_new_err_deg_last = 0.0f;
+volatile float hall_pred_old_err_deg_max = 0.0f;
+volatile float hall_pred_new_err_deg_max = 0.0f;
+volatile float hall_pred_old_err_deg_sum = 0.0f;
+volatile float hall_pred_new_err_deg_sum = 0.0f;
+
+//-----------HALL-------------------
+
+volatile uint32_t adc_callback_test_count = 0;
+
+
+//------------------ALIGN-------------------
+#define ALIGN_TEST_DURATION_MS  3000U
+#define ALIGN_TEST_V_ALPHA_V    0.5f
+
+volatile uint8_t foc_align_test_request = 0;
+volatile uint8_t foc_align_test_done = 0;
+
+volatile uint32_t align_test_start_ms = 0;
+volatile uint32_t align_test_elapsed_ms = 0;
+volatile uint32_t align_test_calc_count = 0;
+
+volatile float align_test_duty_u = 0.0f;
+volatile float align_test_duty_v = 0.0f;
+volatile float align_test_duty_w = 0.0f;
+
+volatile uint32_t align_test_ccr_u = 0;
+volatile uint32_t align_test_ccr_v = 0;
+volatile uint32_t align_test_ccr_w = 0;
+
+volatile float hall_offset_test_rad = 3.76550007f; /* repeated Hall offset candidate */
+volatile float hall_theta_corrected_test = 0.0f;
+volatile float theta_e_foc = 0.0f;
+
+volatile uint32_t angle_uart_last_ms = 0;
+//---------------------ALIGN-------------------
+
+volatile uint8_t foc_bootstrap_request = 0;
+volatile uint8_t foc_bootstrap_done = 0;
+
+volatile uint32_t bootstrap_start_ms = 0;
+volatile uint32_t bootstrap_elapsed_ms = 0;
+
+volatile uint32_t bootstrap_ccer_snapshot = 0;
+
+volatile uint8_t foc_real_align_request = 0;
+volatile uint8_t foc_real_align_done = 0;
+volatile uint8_t align_after_bootstrap = 0;
+volatile uint32_t align_prepare_start_ms = 0;
+volatile uint32_t align_active_start_ms = 0;
+volatile int8_t align_final_sector = -1;
+volatile float align_max_abs_phase_current = 0.0f;
+
+/* SW3 button settings */
+#define SW3_DEBOUNCE_MS      30U
+#define SW3_LONG_PRESS_MS    500U
+
+/* Debug counters */
+volatile uint32_t sw3_long_press_count = 0;
+volatile uint32_t sw3_align_request_count = 0;
+
+volatile uint32_t align_pwm_ccer_snapshot = 0;
+volatile uint8_t align_pwm_moe_snapshot = 0;
+
+/* Open-loop diagnostics: values remain available after the run. */
+volatile uint8_t foc_open_loop_done = 0U;
+volatile uint8_t open_loop_timeout_hit = 0U;
+volatile uint32_t open_loop_start_ms = 0U;
+volatile uint32_t open_loop_tick_count = 0U;
+volatile uint32_t open_loop_control_count = 0U;
+volatile float open_loop_theta_e = 0.0f;
+volatile float open_loop_speed_cmd_rpm = 0.0f;
+volatile float open_loop_peak_current_a = 0.0f;
+volatile uint32_t open_loop_hall_edge_start = 0U;
+volatile uint32_t open_loop_hall_edge_delta = 0U;
+volatile float open_loop_last_hall_rpm = 0.0f;
+volatile int8_t open_loop_last_hall_direction = 0;
+
+/* Hall calibration progress:
+ * stage=0: next pass is forward (CW); stage=1: next pass reverse (CCW);
+ * stage=2: calibration finished, SW3 no longer starts a power test.
+ * status=0: waiting; 1: CW accepted; 2: success; 3: too few/many edges;
+ * status=4: noisy/non-adjacent edges; 5: forward/reverse disagree. */
+volatile uint8_t hall_calib_stage = 0U;
+volatile uint8_t hall_calib_status = 0U;
+volatile uint8_t hall_calib_valid = 0U;
+volatile int8_t hall_calib_run_direction = 1;
+volatile uint8_t hall_calib_collect_enabled = 0U;
+volatile int8_t hall_calib_last_sector = -1;
+volatile uint32_t hall_calib_last_accepted_ms = 0U;
+volatile uint32_t hall_calib_pass_samples = 0U;
+volatile uint32_t hall_calib_pass_rejects = 0U;
+volatile float hall_calib_sum_sin = 0.0f;
+volatile float hall_calib_sum_cos = 0.0f;
+
+/* Values frozen after each pass; do not rotate the motor manually mid-test. */
+volatile uint32_t hall_calib_cw_samples = 0U;
+volatile uint32_t hall_calib_ccw_samples = 0U;
+volatile uint32_t hall_calib_cw_rejects = 0U;
+volatile uint32_t hall_calib_ccw_rejects = 0U;
+volatile float hall_calib_cw_rad = 0.0f;
+volatile float hall_calib_ccw_rad = 0.0f;
+volatile float hall_calib_direction_diff_rad = 0.0f;
+volatile float hall_calib_offset_est_rad = 0.0f;
+volatile int8_t hall_calib_align_sector = -1;
+volatile float hall_calib_coarse_offset_rad = 0.0f;
+
+/* Retained diagnostics from the first energized Hall current-loop test. */
+volatile uint8_t foc_current_test_done = 0U;
+volatile uint8_t current_test_timeout_hit = 0U;
+volatile uint32_t current_test_start_ms = 0U;
+volatile uint32_t current_test_control_count = 0U;
+volatile uint32_t current_test_hall_edge_start = 0U;
+volatile uint32_t current_test_hall_edge_delta = 0U;
+volatile float current_test_peak_abs_current_a = 0.0f;
+volatile float current_test_peak_voltage_v = 0.0f;
+volatile float current_test_last_id_a = 0.0f;
+volatile float current_test_last_iq_a = 0.0f;
+volatile float current_test_avg_id_a = 0.0f;
+volatile float current_test_avg_iq_a = 0.0f;
+volatile float current_test_avg_iq_error_a = 0.0f;
+volatile uint32_t current_test_steady_samples = 0U;
+volatile uint32_t current_test_steady_limit_samples = 0U;
+
+/* Speed-loop telemetry: update every 10 ms within 20 kHz ADC interrupt. */
+volatile float speed_ref_rpm = 0.0f;
+volatile float speed_feedback_rpm = 0.0f;
+volatile float speed_iq_ref_a = 0.0f;
+volatile float speed_peak_rpm = 0.0f;
+volatile uint8_t speed_feedback_valid = 0U;
+volatile uint32_t speed_run_hall_edges = 0U;
+volatile uint32_t speed_steady_valid_ticks = 0U;
+volatile float speed_steady_rpm_sum = 0.0f;
+volatile uint32_t speed_loop_update_count = 0U;
+static uint32_t speed_loop_next_ms = SPEED_LOOP_PERIOD_MS;
+/* Phase 0: first 100rpm; phase 1: 150rpm; phase 2: return 100rpm.
+ * Speed averages use only VALID filtered Hall feedback in each final 1s. */
+volatile uint8_t speed_profile_phase = 0U;
+static float speed_phase_sum_rpm[3] = {0.0f, 0.0f, 0.0f};
+static float speed_phase_abs_error_sum_rpm[3] = {0.0f, 0.0f, 0.0f};
+volatile uint32_t speed_phase_valid_ticks[3] = {0U, 0U, 0U};
+
+/* One record represents a 50 ms block of approximately 1000 ADC control steps.
+ * id/iq/ref/voltage/integrator are BLOCK MEANS; iq_min/iq_max show spread.
+ * Hall speed and electrical angle are end-of-block SNAPSHOTS. */
+typedef struct
+{
+    uint16_t t_ms;
+    int8_t hall_sector;
+    uint8_t hall_speed_valid;
+    float iq_ref_a;
+    float id_avg_a;
+    float iq_avg_a;
+    float iq_min_a;
+    float iq_max_a;
+    float vd_avg_v;
+    float vq_avg_v;
+    float iq_integral_avg_v;
+    float hall_rpm;
+    float theta_e_rad;
+    float theta_legacy_rad;     /* last legacy estimate (+ calibrated offset) */
+    float edge_old_err_deg;    /* latest Hall-edge prediction error */
+    float edge_new_err_deg;
+    float speed_ref_rpm;       /* 50ms end-of-block speed setpoint */
+    float speed_feedback_rpm;  /* filtered Hall feedback; end-of-block */
+    uint8_t speed_feedback_valid;
+    uint8_t speed_profile_phase;  /* 0/1/2: three speed setpoint stages */
+} CurrentTraceSample_t;
+
+volatile CurrentTraceSample_t current_trace[CURRENT_TRACE_MAX_SAMPLES];
+volatile uint32_t current_trace_count = 0U;
+volatile uint8_t current_trace_dump_pending = 0U;
+volatile uint8_t current_trace_overflow = 0U;
+static uint32_t current_trace_next_ms = CURRENT_TRACE_PERIOD_MS;
+static uint32_t current_trace_block_count = 0U;
+static float current_trace_id_sum = 0.0f;
+static float current_trace_iq_sum = 0.0f;
+static float current_trace_ref_sum = 0.0f;
+static float current_trace_vd_sum = 0.0f;
+static float current_trace_vq_sum = 0.0f;
+static float current_trace_integral_sum = 0.0f;
+static float current_trace_iq_min = 0.0f;
+static float current_trace_iq_max = 0.0f;
+
+volatile uint32_t current_test_ccer_snapshot = 0U;
+volatile uint8_t current_test_moe_snapshot = 0U;
+static float current_test_sum_id_a = 0.0f;
+static float current_test_sum_iq_a = 0.0f;
+static float current_test_sum_iq_error_a = 0.0f;
+
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_OPAMP1_Init(void);
+static void MX_ADC2_Init(void);
+static void MX_OPAMP2_Init(void);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+
+static uint32_t DutyToCCR(float duty);
+
+static void FOC_ResetControl(void);
+static void FOC_SetNeutralPWM(void);
+static void FOC_StateManager(void);
+static void FOC_CheckStartButton(void);
+static void FOC_PWM_Enable(void);
+static void FOC_PWM_Disable(void); //只关闭三�????
+static void FOC_PWM_EmergencyDisable(void); // 全部关闭包括CH4
+static void FOC_TriggerFault(FOC_Fault_t fault_code);
+static void FOC_CheckVdcProtection(void);
+static uint8_t FOC_CanStart(void);
+
+
+static void Hall_UpdateState(void);
+static int8_t Hall_StateToSector(uint8_t state);
+static void Hall_UpdateDirection(int8_t new_sector);
+static void Hall_UpdateSpeed(uint32_t capture);
+static void HallAngle_OnHallEdge(uint32_t capture, int8_t previous_sector,
+                                 int8_t current_sector);
+static void Hall_CheckTimeout(void);
+static float WrapAngle0To2Pi(float angle);
+static void Hall_UpdateElectricalAngle(void);
+static void FOC_CheckOverCurrent(void);
+
+static void FOC_AlignTest_Calculate(void);
+static void FOC_RealAlign_PrepareVector(void);
+static void FOC_OpenLoop_Begin(void);
+static void FOC_OpenLoop_Update(void);
+static void FOC_CurrentTest_Begin(void);
+static void FOC_SpeedLoop_Update(uint32_t elapsed_ms);
+static void FOC_CurrentTrace_Collect(uint32_t elapsed_ms);
+static void FOC_CurrentTrace_DumpUART(void);
+static float HallCalib_WrapMinusPiToPi(float angle);
+static void HallCalib_OnHallEdge(int8_t new_sector);
+static void HallCalib_FinishPass(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+
+static uint32_t DutyToCCR(float duty)
+{
+    uint32_t arr;
+    uint32_t period;
+    uint32_t ccr;
+
+    arr =
+        __HAL_TIM_GET_AUTORELOAD(&htim1);
+
+    period =
+        arr + 1U;
+
+
+    if (duty < 0.0f)
+    {
+        duty = 0.0f;
+    }
+
+    if (duty > 1.0f)
+    {
+        duty = 1.0f;
+    }
+
+
+    ccr =
+        (uint32_t)(duty * (float)period);
+
+
+    if (ccr > arr)
+    {
+        ccr = arr;
+    }
+
+
+    return ccr;
+}
+
+// -----------------------state manager begin------------------------
+static void FOC_ResetControl(void)
+{
+    PI_Reset(&pi_id);
+    PI_Reset(&pi_iq);
+    PI_Reset(&pi_speed);
+
+    vd_cmd = 0.0f;
+    vq_cmd = 0.0f;
+
+    v_alpha_cmd = 0.0f;
+    v_beta_cmd  = 0.0f;
+}
+
+static void FOC_SetNeutralPWM(void)
+{
+    uint32_t arr;
+    uint32_t mid;
+
+    arr =
+        __HAL_TIM_GET_AUTORELOAD(&htim1);
+
+    mid =
+        (arr + 1U) / 2U;
+
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_1,
+                          mid);
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_2,
+                          mid);
+
+    __HAL_TIM_SET_COMPARE(&htim1,
+                          TIM_CHANNEL_3,
+                          mid);
+}
+
+static void FOC_CheckStartButton(void)
+{
+    static uint8_t raw_last = 0U;
+    static uint8_t stable_pressed = 0U;
+
+    static uint8_t armed = 0U;
+    static uint8_t handled = 0U;
+    static uint8_t press_allowed = 0U;
+
+    static uint32_t change_ms = 0U;
+    static uint32_t press_start_ms = 0U;
+
+    uint32_t now = HAL_GetTick();
+
+    uint8_t raw_pressed =
+        (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13)
+         == GPIO_PIN_SET) ? 1U : 0U;
+
+    /* 1. Detect raw input changes */
+    if (raw_pressed != raw_last)
+    {
+        raw_last = raw_pressed;
+        change_ms = now;
+    }
+
+    /* 2. Debounce for 30 ms */
+    if ((uint32_t)(now - change_ms) < SW3_DEBOUNCE_MS)
+    {
+        return;
+    }
+
+    /* 3. Update stable button state */
+    if (raw_pressed != stable_pressed)
+    {
+        stable_pressed = raw_pressed;
+
+        if (stable_pressed)
+        {
+            press_start_ms = now;
+            handled = 0U;
+
+            /* Only a fresh press in READY is accepted */
+            press_allowed =
+                (armed &&
+                 ((foc_state == FOC_STATE_READY) ||
+                  (foc_state == FOC_STATE_OPEN_LOOP) ||
+                  (foc_state == FOC_STATE_RUN)) &&
+                 current_offset_done == 1U &&
+                 foc_fault_request == 0U) ? 1U : 0U;
+
+            armed = 0U;
+        }
+        else
+        {
+            /* Release re-arms the button */
+            handled = 0U;
+            armed = 1U;
+        }
+    }
+
+    /* Released: wait for a new press */
+    if (!stable_pressed)
+    {
+        armed = 1U;
+        return;
+    }
+
+    /* 4. Long press, only once per press */
+    if ((!handled) &&
+        ((uint32_t)(now - press_start_ms)
+         >= SW3_LONG_PRESS_MS))
+    {
+        handled = 1U;
+
+        sw3_long_press_count++;
+
+        if (press_allowed &&
+            ((foc_state == FOC_STATE_OPEN_LOOP) ||
+             (foc_state == FOC_STATE_RUN)) &&
+            foc_fault_request == 0U)
+        {
+            /* Long press during powered control -> request early stop. */
+            foc_stop_request = 1U;
+        }
+        else if (press_allowed &&
+                 foc_state == FOC_STATE_READY &&
+                 foc_fault_request == 0U &&
+                 foc_real_align_request == 0U)
+        {
+            foc_real_align_request = 1U;
+            sw3_align_request_count++;
+        }
+    }
+}
+
+static void FOC_StateManager(void)
+{
+
+
+	/* ---------- Global fault request ---------- */
+    if (foc_fault_request)
+    {
+        foc_fault_request = 0;
+
+        FOC_PWM_EmergencyDisable();
+        align_after_bootstrap = 0;
+
+        FOC_ResetControl();
+        FOC_SetNeutralPWM();
+
+        foc_state = FOC_STATE_FAULT;  //
+    }
+
+
+    switch (foc_state)
+    {
+        case FOC_STATE_INIT:
+        {
+            /* Initialization is handled in main() */
+            break;
+        }
+
+
+        case FOC_STATE_CALIBRATION:
+        {
+            /* Offset calibration is handled
+             * inside ADC injected ISR.  //偏移校准在ADC注入式ISR内部处理
+             */
+            break;
+        }
+
+
+        case FOC_STATE_READY:
+        {
+            /* A dedicated real-alignment request must always charge bootstrap first. */
+            if (foc_real_align_request != 0U)
+            {
+                foc_real_align_request = 0U;
+                /* The two-pass calibration is finished: require MCU reset for another run. */
+                if ((HALL_CALIB_MODE != 0U) && (hall_calib_stage >= 2U))
+                {
+                    break;
+                }
+                if (FOC_CanStart() && hall_angle_valid)
+                {
+                    foc_real_align_done = 0U;
+                    align_max_abs_phase_current = 0.0f;
+                    align_after_bootstrap = 1U;
+                    foc_bootstrap_request = 1U;
+                }
+                break;
+            }
+
+        	if (foc_bootstrap_request)
+        	{
+        	    foc_bootstrap_request = 0;
+
+        	    if (FOC_CanStart())
+        	    {
+        	        /* Disable all three-phase outputs first */
+        	        FOC_PWM_Disable();
+
+        	        FOC_ResetControl();
+
+        	        /* PWM1: CCR=0 means high-side off,
+        	           complementary low-side command active */
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+        	        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+
+        	        foc_bootstrap_done = 0;
+        	        bootstrap_elapsed_ms = 0;
+        	        bootstrap_ccer_snapshot = 0;
+
+        	        bootstrap_start_ms = HAL_GetTick();
+
+        	        foc_state = FOC_STATE_BOOTSTRAP_PREPARE;
+        	    }
+        	    else
+        	    {
+        	        /* 启动条件不满足，清除待执行的定位任务 */
+        	        align_after_bootstrap = 0U;
+        	    }
+
+        	    break;
+        	}
+        	if (foc_align_test_request)
+        	{
+        	    foc_align_test_request = 0;
+
+        	    if (FOC_CanStart())
+        	    {
+        	        /* Power outputs must remain disabled */
+        	        FOC_PWM_Disable();
+
+        	        FOC_ResetControl();
+        	        FOC_SetNeutralPWM();
+
+        	        foc_align_test_done = 0;
+        	        align_test_calc_count = 0;
+        	        align_test_elapsed_ms = 0;
+
+        	        align_test_start_ms = HAL_GetTick();
+
+        	        foc_state = FOC_STATE_ALIGN_TEST;
+        	    }
+
+        	    break;
+        	}
+            /* ---------- Original normal start ---------- */
+            if (foc_start_request)
+            {
+                /*
+                 * Consume this start request.
+                 */
+                foc_start_request = 0;
+
+
+                /*
+                 * Check whether the system
+                 * is really allowed to run.
+                 */
+                if (FOC_CanStart())
+                {
+                    FOC_ResetControl();
+
+                    FOC_SetNeutralPWM();
+
+
+                    /*
+                     * Real power PWM is NOT enabled yet.
+                     * Real rotor electrical angle
+                     * has not been established.
+                     */
+                    // FOC_PWM_Enable();
+
+
+                    /* RUN is deliberately locked until actual Hall offset calibration. */
+                    /* foc_state = FOC_STATE_RUN; */
+                }
+            }
+
+            break;
+        }
+
+        case FOC_STATE_ALIGN_TEST:
+        {
+            /* Never enable physical phase PWM */
+            FOC_PWM_Disable();
+
+            align_test_elapsed_ms =
+                (uint32_t)(
+                    HAL_GetTick() - align_test_start_ms
+                );
+
+            /* Allow manual cancellation */
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            /* Automatically finish after 3 seconds */
+            if (align_test_elapsed_ms >= ALIGN_TEST_DURATION_MS)
+            {
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+
+                foc_align_test_done = 1;
+
+                foc_state = FOC_STATE_READY;
+            }
+
+            break;
+        }
+
+        case FOC_STATE_BOOTSTRAP_PREPARE:
+        {
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                align_after_bootstrap = 0U;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            /* Wait for CCR=0 to take effect */
+            if ((uint32_t)(HAL_GetTick() - bootstrap_start_ms)
+                >= BOOTSTRAP_PREPARE_MS)
+            {
+                /* Keep high-side channels disabled */
+                CLEAR_BIT(TIM1->CCER,
+                          TIM_CCER_CC1E |
+                          TIM_CCER_CC2E |
+                          TIM_CCER_CC3E);
+
+                /*
+                 * Enable complementary outputs only:
+                 * CH1N, CH2N, CH3N.
+                 */
+                SET_BIT(TIM1->CCER,
+                        TIM_CCER_CC1NE |
+                        TIM_CCER_CC2NE |
+                        TIM_CCER_CC3NE);
+
+                bootstrap_ccer_snapshot =
+                    TIM1->CCER & 0x0555U;
+
+                bootstrap_start_ms = HAL_GetTick();
+
+                foc_state = FOC_STATE_BOOTSTRAP_CHARGE;
+            }
+
+            break;
+        }
+
+        case FOC_STATE_BOOTSTRAP_CHARGE:
+        {
+            bootstrap_elapsed_ms =
+                (uint32_t)(HAL_GetTick() - bootstrap_start_ms);
+
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                align_after_bootstrap = 0U;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            if (bootstrap_elapsed_ms >= BOOTSTRAP_CHARGE_MS)
+            {
+                /* Disable low-side outputs BEFORE restoring CCR */
+                FOC_PWM_Disable();
+
+                FOC_SetNeutralPWM();
+
+                foc_bootstrap_done = 1;
+                if (align_after_bootstrap != 0U)
+                {
+                    align_after_bootstrap = 0U;
+                    FOC_ResetControl();
+                    FOC_RealAlign_PrepareVector();
+                    align_prepare_start_ms = HAL_GetTick();
+                    foc_state = FOC_STATE_ALIGN_PREPARE;
+                }
+                else
+                {
+                    foc_state = FOC_STATE_READY;
+                }
+            }
+
+            break;
+        }
+
+        case FOC_STATE_ALIGN_PREPARE:
+        {
+            if (foc_stop_request)
+            {
+                foc_stop_request = 0;
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+                break;
+            }
+
+            if ((uint32_t)(HAL_GetTick() - align_prepare_start_ms) >= ALIGN_PREPARE_MS)
+            {
+#if ALIGN_POWER_ALLOWED
+                if (FOC_CanStart() && hall_angle_valid)
+                {
+                    /* CCRs have been preloaded; now enable physical outputs. */
+                	FOC_PWM_Enable();
+
+                	/* Record PWM enable status */
+                	align_pwm_ccer_snapshot =
+                	    TIM1->CCER & 0x0555U;
+
+                	align_pwm_moe_snapshot =
+                	    ((TIM1->BDTR & TIM_BDTR_MOE) != 0U)
+                	    ? 1U : 0U;
+
+                	align_active_start_ms = HAL_GetTick();
+
+                	foc_state = FOC_STATE_ALIGN_ACTIVE;
+                }
+                else
+                {
+                    FOC_PWM_Disable();
+                    FOC_SetNeutralPWM();
+                    foc_state = FOC_STATE_READY;
+                }
+#else
+                /* Power interlock is closed: never energize motor. */
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                foc_state = FOC_STATE_READY;
+#endif
+            }
+            break;
+        }
+
+        case FOC_STATE_ALIGN_ACTIVE:
+        {
+            uint8_t natural_completion =
+                ((uint32_t)(HAL_GetTick() - align_active_start_ms) >= ALIGN_ACTIVE_MS);
+            if (foc_stop_request || natural_completion)
+            {
+                uint8_t was_cancelled = foc_stop_request;
+                foc_stop_request = 0;
+                align_final_sector = hall_sector;
+                foc_real_align_done = (natural_completion && !was_cancelled) ? 1U : 0U;
+                /* At theta_s=0, the Hall sector center supplies ONLY a coarse hint. */
+                if ((HALL_CALIB_MODE != 0U) && (hall_sector >= 0) &&
+                    foc_real_align_done)
+                {
+                    hall_calib_align_sector = hall_sector;
+                    hall_calib_coarse_offset_rad = WrapAngle0To2Pi(
+                        -((float)hall_sector + 0.5f) * HALL_SECTOR_ANGLE_RAD);
+                }
+
+                if (foc_real_align_done &&
+                    (foc_fault_request == 0U) &&
+                    (foc_fault_code == FOC_FAULT_NONE) &&
+                    (hall_angle_valid != 0U) &&
+                    ((TIM1->CCER & 0x0555U) == 0x0555U) &&
+                    (CURRENT_TEST_AFTER_ALIGN != 0U))
+                {
+                    /* Keep PWM on; start bounded Hall speed+current control. */
+                    FOC_CurrentTest_Begin();
+                    foc_state = FOC_STATE_RUN;
+                }
+                else if (foc_real_align_done &&
+                         (foc_fault_request == 0U) &&
+                         (foc_fault_code == FOC_FAULT_NONE) &&
+                         ((TIM1->CCER & 0x0555U) == 0x0555U) &&
+                         (OPEN_LOOP_AFTER_ALIGN != 0U))
+                {
+                    /* Previous open-loop option remains available. */
+                    FOC_OpenLoop_Begin();
+                    foc_state = FOC_STATE_OPEN_LOOP;
+                }
+                else
+                {
+                    FOC_PWM_Disable();
+                    FOC_SetNeutralPWM();
+                    foc_state = FOC_STATE_READY;
+                }
+            }
+            break;
+        }
+
+        case FOC_STATE_OPEN_LOOP:
+        {
+            uint8_t elapsed =
+                ((uint32_t)(HAL_GetTick() - open_loop_start_ms) >= OPEN_LOOP_DURATION_MS);
+            if (foc_stop_request || open_loop_timeout_hit || elapsed)
+            {
+                uint8_t stopped_early = foc_stop_request;
+                foc_stop_request = 0U;
+                /* Disable output BEFORE restoring neutral CCR values. */
+                FOC_PWM_Disable();
+                FOC_SetNeutralPWM();
+                open_loop_hall_edge_delta = hall_edge_count - open_loop_hall_edge_start;
+                foc_open_loop_done = (!stopped_early &&
+                                     foc_fault_request == 0U &&
+                                     foc_fault_code == FOC_FAULT_NONE) ? 1U : 0U;
+                /* Freeze ISR samples before computing the per-pass offset. */
+                hall_calib_collect_enabled = 0U;
+                if ((HALL_CALIB_MODE != 0U) && foc_open_loop_done)
+                {
+                    HallCalib_FinishPass();
+                }
+                foc_state = FOC_STATE_READY;
+            }
+            break;
+        }
+
+        case FOC_STATE_RUN:
+        {
+            uint8_t elapsed =
+                ((uint32_t)(HAL_GetTick() - current_test_start_ms)
+                 >= CURRENT_TEST_DURATION_MS) ? 1U : 0U;
+            if (foc_stop_request || current_test_timeout_hit || elapsed)
+            {
+                uint8_t cancelled = foc_stop_request;
+                foc_stop_request = 0U;
+                FOC_PWM_Disable();  /* switch off BEFORE neutral compare values */
+                FOC_SetNeutralPWM();
+
+                current_test_hall_edge_delta =
+                    hall_edge_count - current_test_hall_edge_start;
+                if (current_test_steady_samples > 0U)
+                {
+                    float n = (float)current_test_steady_samples;
+                    current_test_avg_id_a = current_test_sum_id_a / n;
+                    current_test_avg_iq_a = current_test_sum_iq_a / n;
+                    current_test_avg_iq_error_a = current_test_sum_iq_error_a / n;
+                }
+                foc_current_test_done =
+                    (!cancelled && !foc_fault_request &&
+                     foc_fault_code == FOC_FAULT_NONE) ? 1U : 0U;
+                /* The capture buffer is frozen: RUN updates cease in READY.
+                 * Serial output will happen in main(), only after PWM is off. */
+                current_trace_dump_pending = 1U;
+                id_ref = 0.0f;
+                iq_ref = 0.0f;
+                FOC_ResetControl();
+                foc_state = FOC_STATE_READY;
+            }
+            break;
+        }
+
+
+        case FOC_STATE_FAULT:
+        {
+            /*
+             * Keep outputs disabled while fault is latched.
+             */
+            FOC_PWM_EmergencyDisable();
+
+            FOC_ResetControl();
+            FOC_SetNeutralPWM();
+
+
+            /*
+             * Explicit fault reset is required.
+             */
+            if (foc_fault_reset_request)
+            {
+                foc_fault_reset_request = 0;
+
+
+                /*
+                 * Reset current offset calibration.
+                 */
+                current_offset_done  = 0;
+                current_offset_count = 0;
+
+                iu_offset_sum = 0;
+                iv_offset_sum = 0;
+
+
+                /*
+                 * Reset controller.
+                 */
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+
+
+                /*
+                 * Disable phase outputs first.
+                 * CH4 remains enabled.
+                 */
+                FOC_PWM_Disable();
+
+
+                /*
+                 * MOE was cleared by EmergencyDisable.
+                 * Re-enable MOE so CH4 can trigger ADC again.
+                 *
+                 * CH1~CH3 are still disabled in CCER,
+                 * therefore phase power outputs remain OFF.
+                 */
+                __HAL_TIM_MOE_ENABLE(&htim1);
+
+
+                /*
+                 * Clear latched fault information.
+                 */
+                foc_fault_code = FOC_FAULT_NONE;
+
+
+                /*
+                 * Re-calibrate current offset before READY.
+                 */
+                foc_state = FOC_STATE_CALIBRATION;
+            }
+
+            break;
+        }
+
+
+        default:
+        {
+            FOC_ResetControl();
+            FOC_SetNeutralPWM();
+
+            foc_state = FOC_STATE_FAULT;
+
+            break;
+        }
+    }
+}
+
+
+static void FOC_PWM_Enable(void)
+{
+    __HAL_TIM_MOE_ENABLE(&htim1);
+    SET_BIT(TIM1->CCER,
+            TIM_CCER_CC1E  |
+            TIM_CCER_CC1NE |
+            TIM_CCER_CC2E  |
+            TIM_CCER_CC2NE |
+            TIM_CCER_CC3E  |
+            TIM_CCER_CC3NE);
+}
+
+static void FOC_PWM_Disable(void)
+{
+    CLEAR_BIT(TIM1->CCER,
+              TIM_CCER_CC1E  |
+              TIM_CCER_CC1NE |
+              TIM_CCER_CC2E  |
+              TIM_CCER_CC2NE |
+              TIM_CCER_CC3E  |
+              TIM_CCER_CC3NE);
+}
+
+static void FOC_TriggerFault(FOC_Fault_t fault_code)
+{
+    /*
+     * Only latch the first fault.
+     */
+    if ((foc_state != FOC_STATE_FAULT) &&
+        (foc_fault_request == 0))
+    {
+        foc_fault_code = fault_code;
+        if (foc_state == FOC_STATE_RUN)
+            current_trace_dump_pending = 1U;
+
+        /*
+         * Immediately stop inverter output.
+         */
+        FOC_PWM_EmergencyDisable();
+
+        /*
+         * Ask state manager to enter FAULT.
+         */
+        foc_fault_request = 1;
+    }
+}
+
+static void FOC_PWM_EmergencyDisable(void)
+{
+    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+}
+
+static void FOC_CheckVdcProtection(void)
+{
+    /* ==========================================
+     * Over-voltage protection
+     * READY �???? RUN 都可以检测过�????
+     * ========================================== */
+    if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+        (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_OPEN_LOOP) ||
+        (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
+    	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
+		(foc_state == FOC_STATE_READY) ||
+    	(foc_state == FOC_STATE_ALIGN_TEST) ||
+        (foc_state == FOC_STATE_RUN)  )
+    {
+        if (vdc_bus > vdc_ov_trip)
+        {
+            if (vdc_ov_counter < VDC_FAULT_CONFIRM_SAMPLES)
+            {
+                vdc_ov_counter++;
+            }
+
+            if (vdc_ov_counter >= VDC_FAULT_CONFIRM_SAMPLES)
+            {
+                FOC_TriggerFault(
+                    FOC_FAULT_VDC_OVERVOLTAGE);
+            }
+        }
+        else
+        {
+            vdc_ov_counter = 0;
+        }
+    }
+    else
+    {
+        vdc_ov_counter = 0;
+    }
+
+
+    /* ==========================================
+     * Under-voltage protection
+     * 当前只在 RUN 中检�????
+     * ========================================== */
+    if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+        (foc_state == FOC_STATE_ALIGN_ACTIVE) ||
+        (foc_state == FOC_STATE_OPEN_LOOP) ||
+        (foc_state == FOC_STATE_BOOTSTRAP_PREPARE) ||
+    	(foc_state == FOC_STATE_BOOTSTRAP_CHARGE) ||
+		(foc_state == FOC_STATE_ALIGN_TEST) ||
+		foc_state == FOC_STATE_RUN)
+    {
+        if (vdc_bus < vdc_uv_trip)
+        {
+            if (vdc_uv_counter < VDC_FAULT_CONFIRM_SAMPLES)
+            {
+                vdc_uv_counter++;
+            }
+
+            if (vdc_uv_counter >= VDC_FAULT_CONFIRM_SAMPLES)
+            {
+                FOC_TriggerFault(
+                    FOC_FAULT_VDC_UNDERVOLTAGE);
+            }
+        }
+        else
+        {
+            vdc_uv_counter = 0;
+        }
+    }
+    else
+    {
+        vdc_uv_counter = 0;
+    }
+}
+
+static uint8_t FOC_CanStart(void)
+{
+    /*
+     * 1. Current offset calibration must be finished.
+     */
+    if (current_offset_done == 0)
+    {
+        return 0;
+    }
+
+
+    /*
+     * 2. There must be no active fault.
+     */
+    if ((foc_fault_request != 0) ||  //have fault return 0
+        (foc_fault_code != FOC_FAULT_NONE))
+    {
+        return 0;
+    }
+
+
+    /*
+     * 3. DC bus voltage must be inside
+     *    the allowed operating range.
+     */
+    if (vdc_bus <= vdc_uv_trip)
+    {
+        return 0;
+    }
+
+    if (vdc_bus >= vdc_ov_trip)
+    {
+        return 0;
+    }
+
+
+    /*
+     * All current start conditions are satisfied.
+     */
+    return 1;
+}
+
+static void FOC_CheckOverCurrent(void)
+{
+    uint8_t over_current = 0;
+
+    iw_a = -(iu_a + iv_a);
+
+    if ((iu_a > CURRENT_OC_TRIP_A) ||
+        (iu_a < -CURRENT_OC_TRIP_A) ||
+        (iv_a > CURRENT_OC_TRIP_A) ||
+        (iv_a < -CURRENT_OC_TRIP_A) ||
+        (iw_a > CURRENT_OC_TRIP_A) ||
+        (iw_a < -CURRENT_OC_TRIP_A))
+    {
+        over_current = 1;
+    }
+
+
+    if (over_current)
+    {
+        if (current_oc_counter < CURRENT_OC_CONFIRM_SAMPLES)
+        {
+            current_oc_counter++;
+        }
+
+        if (current_oc_counter >= CURRENT_OC_CONFIRM_SAMPLES)
+        {
+            FOC_TriggerFault(FOC_FAULT_OVERCURRENT);
+        }
+    }
+    else
+    {
+        current_oc_counter = 0;
+    }
+}
+
+// -----------------------state manager end------------------------
+
+// -----------------HALL begin----------------------
+static void Hall_UpdateState(void)
+{
+    hall_a =
+        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET);
+
+    hall_b =
+        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET);
+
+    hall_c =
+        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8) == GPIO_PIN_SET);
+
+
+    hall_state =
+        (hall_a << 2) |
+        (hall_b << 1) |
+         hall_c;
+}
+
+static int8_t Hall_StateToSector(uint8_t state)
+{
+    switch (state)
+    {
+        case 1:  return 0;   // 001
+        case 3:  return 1;   // 011
+        case 2:  return 2;   // 010
+        case 6:  return 3;   // 110
+        case 4:  return 4;   // 100
+        case 5:  return 5;   // 101
+
+        default:
+        	return -1;  // 000 / 111 invalid
+    }
+}
+
+static void Hall_UpdateDirection(int8_t new_sector)
+{
+    /* Invalid Hall state */
+    if (new_sector < 0)    //后面引用是里面放的是hall_sector，这个�?�初始定义为-1，这说明当没转的时�?�还不知道方�???
+    	                   // 但是在中断中hall_sector = Hall_StateToSector(hall_state);
+    {
+        hall_direction = HALL_DIR_UNKNOWN;
+        return;
+    }
+
+
+    /* First valid Hall state */
+    if (hall_prev_sector < 0)  // 当刚�???机没转时候，程序等于没存前一次的sector的�?�，�???以到定义，为�???么定义为-1呢，
+    	                       // 这是因为，为了方便将第一次采集到的�?�幅值给hall_prev_sector
+    {
+        hall_prev_sector = new_sector;
+        return;
+    }
+
+
+    /* Clockwise */
+    if (new_sector ==
+        ((hall_prev_sector + 1) % 6))
+    {
+        hall_direction = HALL_DIR_CW;
+    }
+
+    /* Counter-clockwise */
+    else if (new_sector ==
+             ((hall_prev_sector + 5) % 6))
+    {
+        hall_direction = HALL_DIR_CCW;
+    }
+
+    /* Illegal jump */
+    else if (new_sector != hall_prev_sector)  //use record illegal jump
+    {
+        hall_direction = HALL_DIR_UNKNOWN;
+    }
+
+
+    hall_prev_sector = new_sector;
+}
+
+static void Hall_UpdateSpeed(uint32_t capture)
+{
+    float delta_t;
+    float direction_sign;
+
+
+    /* Invalid capture */
+    if (capture == 0U)
+    {
+        hall_speed_valid = 0;
+        return;
+    }
+
+
+    /* Direction cannot be determined yet */
+    if (hall_direction == HALL_DIR_UNKNOWN)
+    {
+        hall_speed_valid = 0;
+        return;
+    }
+
+
+    /* Capture count -> seconds */
+    delta_t =
+        (float)capture
+        * HALL_TIMER_TICK_S;
+
+
+    /* CW positive, CCW negative */
+    direction_sign =
+        (hall_direction == HALL_DIR_CW)
+        ? 1.0f
+        : -1.0f;
+
+
+    /* Electrical angular velocity */
+    hall_omega_e =
+        direction_sign
+        * (PI_F / 3.0f)
+        / delta_t;
+
+
+    /* Mechanical angular velocity */
+    hall_omega_m =
+        hall_omega_e
+        / MOTOR_POLE_PAIRS;
+
+
+    /* Mechanical speed */
+    hall_speed_rpm =
+        hall_omega_m
+        * 60.0f
+        / (2.0f * PI_F);
+
+
+    /* Speed is now valid */
+    hall_speed_valid = 1;
+}
+
+/* TIM4 Hall edge: compute the speed AT the new edge, not merely the
+ * average speed of the preceding 60-degree electrical sector.
+ * Keep this short: it executes only at Hall transitions. */
+static void HallAngle_OnHallEdge(uint32_t capture, int8_t previous_sector,
+                                 int8_t current_sector)
+{
+    float dt = (float)capture * HALL_TIMER_TICK_S;
+    Hall_Direction_t direction = hall_direction;
+    int8_t expected;
+    float average_speed_abs;
+    float accel_abs = 0.0f;
+    float edge_speed_abs;
+    float sign;
+
+    if (direction == HALL_DIR_CW)
+        expected = (int8_t)((previous_sector + 1) % 6);
+    else if (direction == HALL_DIR_CCW)
+        expected = (int8_t)((previous_sector + 5) % 6);
+    else
+        expected = -1;
+
+    if ((previous_sector < 0) || (current_sector < 0) ||
+        (current_sector != expected) ||
+        (dt < HALL_PRED_MIN_INTERVAL_S) ||
+        (dt > HALL_PRED_MAX_INTERVAL_S))
+    {
+        hall_pred_ready = 0U;
+        hall_pred_have_prev_interval = 0U;
+        hall_pred_direction = HALL_DIR_UNKNOWN;
+        hall_pred_omega_edge_e = 0.0f;
+        hall_pred_accel_e = 0.0f;
+        return;
+    }
+
+    sign = (direction == HALL_DIR_CW) ? 1.0f : -1.0f;
+
+    /* Compare how far each estimator predicted that the rotor would travel
+     * during this just-completed Hall sector.  One sector is exactly pi/3.
+     * This uses the full measured interval, not delayed UART snapshots. */
+    if ((foc_state == FOC_STATE_RUN) &&
+        (hall_pred_ready != 0U) &&
+        (hall_pred_direction == direction))
+    {
+        float legacy_distance = fabsf(hall_omega_e) * dt;
+        float predicted_distance = sign *
+            (hall_pred_omega_edge_e * dt +
+             0.5f * hall_pred_accel_e * dt * dt);
+        float old_err_deg = fabsf(HALL_SECTOR_ANGLE_RAD - legacy_distance)
+                          * (180.0f / PI_F);
+        float new_err_deg = fabsf(HALL_SECTOR_ANGLE_RAD - predicted_distance)
+                          * (180.0f / PI_F);
+
+        hall_pred_old_err_deg_last = old_err_deg;
+        hall_pred_new_err_deg_last = new_err_deg;
+        if (old_err_deg > hall_pred_old_err_deg_max)
+            hall_pred_old_err_deg_max = old_err_deg;
+        if (new_err_deg > hall_pred_new_err_deg_max)
+            hall_pred_new_err_deg_max = new_err_deg;
+        hall_pred_old_err_deg_sum += old_err_deg;
+        hall_pred_new_err_deg_sum += new_err_deg;
+        hall_pred_edge_err_count++;
+    }
+
+    average_speed_abs = HALL_SECTOR_ANGLE_RAD / dt;
+
+    /* Two sector-average speeds are located at the midpoints of their
+     * respective intervals.  Their midpoint separation is (dt_old+dt)/2. */
+    if ((hall_pred_have_prev_interval != 0U) &&
+        (hall_pred_direction == direction))
+    {
+        float last_average_speed =
+            HALL_SECTOR_ANGLE_RAD / hall_pred_prev_interval_s;
+        float midpoint_interval = 0.5f *
+            (hall_pred_prev_interval_s + dt);
+        accel_abs = (average_speed_abs - last_average_speed) /
+                    midpoint_interval;
+        if (accel_abs > HALL_PRED_MAX_ACCEL_E)
+            accel_abs = HALL_PRED_MAX_ACCEL_E;
+        if (accel_abs < -HALL_PRED_MAX_ACCEL_E)
+            accel_abs = -HALL_PRED_MAX_ACCEL_E;
+    }
+
+    /* Extrapolate average sector speed to its final boundary. Clamp the
+     * extrapolation so a single noisy edge cannot cause runaway speed. */
+    edge_speed_abs = average_speed_abs + 0.5f * accel_abs * dt;
+    if (edge_speed_abs < HALL_PRED_MIN_SPEED_FACTOR * average_speed_abs)
+        edge_speed_abs = HALL_PRED_MIN_SPEED_FACTOR * average_speed_abs;
+    if (edge_speed_abs > HALL_PRED_MAX_SPEED_FACTOR * average_speed_abs)
+        edge_speed_abs = HALL_PRED_MAX_SPEED_FACTOR * average_speed_abs;
+
+    hall_pred_omega_edge_e = sign * edge_speed_abs;
+    hall_pred_accel_e = sign * accel_abs;
+    hall_pred_prev_interval_s = dt;
+    hall_pred_have_prev_interval = 1U;
+    hall_pred_direction = direction;
+    hall_pred_ready = 1U;
+}
+
+static void Hall_CheckTimeout(void)
+{
+    uint32_t now;
+
+
+    /*
+     * No valid speed has been obtained yet.
+     */
+    if (hall_speed_valid == 0)
+    {
+        return;
+    }
+
+
+    now = HAL_GetTick();
+
+
+    /*
+     * No Hall edge for too long.
+     */
+    if ((uint32_t)(now - hall_last_edge_ms)
+        > HALL_STOP_TIMEOUT_MS)
+    {
+        hall_speed_rpm = 0.0f;
+
+        hall_omega_m = 0.0f;
+
+        hall_omega_e = 0.0f;
+
+
+        hall_speed_valid = 0;
+
+
+        /*
+         * Once stopped, old direction
+         * should no longer be trusted.
+         */
+        hall_direction =
+            HALL_DIR_UNKNOWN;
+
+
+        /*
+         * Restart direction detection
+         * from next Hall transition. "St=
+         */
+        hall_prev_sector = -1;
+        hall_pred_ready = 0U;
+        hall_pred_have_prev_interval = 0U;
+        hall_pred_direction = HALL_DIR_UNKNOWN;
+        hall_pred_omega_edge_e = 0.0f;
+        hall_pred_accel_e = 0.0f;
+    }
+}
+
+static float WrapAngle0To2Pi(float angle)  //角度归一�??
+{
+    while (angle >= TWO_PI_F)
+    {
+        angle -= TWO_PI_F;
+    }
+
+    while (angle < 0.0f)
+    {
+        angle += TWO_PI_F;
+    }
+
+    return angle;
+}
+
+static void Hall_UpdateElectricalAngle(void)
+{
+    int8_t sector = hall_sector;
+    Hall_Direction_t direction = hall_direction;
+    float base_angle;
+
+    hall_angle_update_count++;
+    if ((sector < 0) || (sector > 5))
+    {
+        hall_angle_valid = 0U;
+        return;
+    }
+
+    if ((hall_speed_valid != 0U) &&
+        (direction != HALL_DIR_UNKNOWN))
+    {
+        /* TIM4 counter resets at each Hall transition. */
+        uint32_t elapsed_count = __HAL_TIM_GET_COUNTER(&htim4);
+        float t = (float)elapsed_count * HALL_TIMER_TICK_S;
+        float legacy_delta = hall_omega_e * t;
+        float predicted_delta = legacy_delta;
+
+        base_angle = (direction == HALL_DIR_CW)
+            ? (float)sector * HALL_SECTOR_ANGLE_RAD
+            : (float)(sector + 1) * HALL_SECTOR_ANGLE_RAD;
+
+        /* The old algorithm is always retained as an A/B reference. */
+        if (legacy_delta > HALL_SECTOR_ANGLE_RAD)
+            legacy_delta = HALL_SECTOR_ANGLE_RAD;
+        if (legacy_delta < -HALL_SECTOR_ANGLE_RAD)
+            legacy_delta = -HALL_SECTOR_ANGLE_RAD;
+        hall_theta_legacy_rel = WrapAngle0To2Pi(base_angle + legacy_delta);
+
+#if HALL_ANGLE_PREDICT_ENABLE
+        if ((hall_pred_ready != 0U) && (hall_pred_direction == direction))
+        {
+            /* Angle since last Hall edge under constant acceleration:
+             * delta = omega_edge*t + (1/2)*accel*t^2. */
+            /* When decelerating toward zero, freeze the predicted position
+             * rather than letting the parabola turn backwards inside one sector. */
+            float t_predict = t;
+            float signed_speed = (direction == HALL_DIR_CW)
+                ? hall_pred_omega_edge_e : -hall_pred_omega_edge_e;
+            float signed_accel = (direction == HALL_DIR_CW)
+                ? hall_pred_accel_e : -hall_pred_accel_e;
+            if ((signed_accel < 0.0f) &&
+                (signed_speed + signed_accel * t < 0.0f))
+                t_predict = signed_speed / (-signed_accel);
+            predicted_delta = hall_pred_omega_edge_e * t_predict +
+                              0.5f * hall_pred_accel_e * t_predict * t_predict;
+        }
+        else
+        {
+            predicted_delta = legacy_delta;
+        }
+        /* The Hall code itself bounds position within a 60-degree sector.
+         * Do NOT use an LPF that can delay true position during acceleration. */
+        if (direction == HALL_DIR_CW)
+        {
+            if (predicted_delta < 0.0f) predicted_delta = 0.0f;
+            if (predicted_delta > HALL_SECTOR_ANGLE_RAD)
+                predicted_delta = HALL_SECTOR_ANGLE_RAD;
+        }
+        else
+        {
+            if (predicted_delta > 0.0f) predicted_delta = 0.0f;
+            if (predicted_delta < -HALL_SECTOR_ANGLE_RAD)
+                predicted_delta = -HALL_SECTOR_ANGLE_RAD;
+        }
+        hall_theta_rel = WrapAngle0To2Pi(base_angle + predicted_delta);
+#else
+        hall_theta_rel = hall_theta_legacy_rel;
+#endif
+    }
+    else
+    {
+        /* With no fresh speed/direction, Hall yields only sector center. */
+        base_angle = ((float)sector + 0.5f) * HALL_SECTOR_ANGLE_RAD;
+        hall_theta_legacy_rel = WrapAngle0To2Pi(base_angle);
+        hall_theta_rel = hall_theta_legacy_rel;
+    }
+    hall_angle_valid = 1U;
+}
+
+// -----------------HALL end----------------------
+
+
+static void FOC_RealAlign_PrepareVector(void)
+{
+    float va = ALIGN_V_ALPHA_V;
+    float vb = 0.0f;
+    SVPWM_Output_t out = {0};
+
+    /* The outputs MUST be disabled before writing these CCR values. */
+    FOC_PWM_Disable();
+    SVPWM_LimitVoltage(&va, &vb, vdc_bus);
+    SVPWM_Run(va, vb, vdc_bus, &out);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DutyToCCR(out.duty_u));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DutyToCCR(out.duty_v));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DutyToCCR(out.duty_w));
+}
+
+/* Reset all open-loop status BEFORE changing foc_state to OPEN_LOOP. */
+static void FOC_OpenLoop_Begin(void)
+{
+    foc_open_loop_done = 0U;
+    open_loop_timeout_hit = 0U;
+    open_loop_tick_count = 0U;
+    open_loop_control_count = 0U;
+    open_loop_theta_e = 0.0f;         /* seamless transition from alignment at alpha axis */
+    open_loop_speed_cmd_rpm = 0.0f;
+    open_loop_peak_current_a = 0.0f;
+    open_loop_hall_edge_start = hall_edge_count;
+    open_loop_hall_edge_delta = 0U;
+    open_loop_last_hall_rpm = 0.0f;
+    open_loop_last_hall_direction = 0;
+    open_loop_start_ms = HAL_GetTick();
+
+    if (HALL_CALIB_MODE != 0U)
+    {
+        /* First SW3 run rotates forward; second SW3 run rotates backward. */
+        hall_calib_run_direction = (hall_calib_stage == 0U) ? 1 : -1;
+        hall_calib_last_sector = hall_sector;
+        hall_calib_last_accepted_ms = 0U;
+        hall_calib_pass_samples = 0U;
+        hall_calib_pass_rejects = 0U;
+        hall_calib_sum_sin = 0.0f;
+        hall_calib_sum_cos = 0.0f;
+        hall_calib_collect_enabled = 1U;
+        hall_calib_status = 0U;
+    }
+}
+
+/* Called at 20 kHz INSIDE the ADC injected callback, only in OPEN_LOOP. */
+static void FOC_OpenLoop_Update(void)
+{
+    float ramp;
+    float omega_e;
+    float va, vb;
+    AlphaBeta_t voltage_ab = {0};
+    SVPWM_Output_t duty = {0};
+
+    if ((open_loop_timeout_hit != 0U) || (foc_fault_request != 0U))
+    {
+        return;
+    }
+
+    open_loop_control_count++;
+
+    /* Stop if the bus leaves the permitted range; do not divide by an invalid Vdc. */
+    if (vdc_bus <= vdc_uv_trip)
+    {
+        FOC_TriggerFault(FOC_FAULT_VDC_UNDERVOLTAGE);
+        return;
+    }
+    if (vdc_bus >= vdc_ov_trip)
+    {
+        FOC_TriggerFault(FOC_FAULT_VDC_OVERVOLTAGE);
+        return;
+    }
+
+    /* A discrete speed ramp avoids a sudden jump to the commanded speed. */
+    if (open_loop_tick_count < OPEN_LOOP_RAMP_TICKS)
+    {
+        open_loop_tick_count++;
+    }
+
+    ramp = (float)open_loop_tick_count / (float)OPEN_LOOP_RAMP_TICKS;
+    open_loop_speed_cmd_rpm = OPEN_LOOP_TARGET_RPM * ramp;
+    if (HALL_CALIB_MODE != 0U)
+    {
+        open_loop_speed_cmd_rpm *= (float)hall_calib_run_direction;
+    }
+
+    omega_e = (TWO_PI_F * MOTOR_POLE_PAIRS / 60.0f)
+              * open_loop_speed_cmd_rpm;
+    open_loop_theta_e = WrapAngle0To2Pi(
+        open_loop_theta_e + omega_e * CURRENT_LOOP_TS);
+
+    /* Rotate vd=constant, vq=0 through an artificial electrical angle. */
+    InvPark_Run(OPEN_LOOP_VOLTAGE_V, 0.0f, open_loop_theta_e, &voltage_ab);
+    va = voltage_ab.alpha;
+    vb = voltage_ab.beta;
+    SVPWM_LimitVoltage(&va, &vb, vdc_bus);
+    SVPWM_Run(va, vb, vdc_bus, &duty);
+
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DutyToCCR(duty.duty_u));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, DutyToCCR(duty.duty_v));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, DutyToCCR(duty.duty_w));
+}
+
+/* Begin ONE Hall speed+current cascade test after fixed-vector alignment.
+ * PWM remains enabled; the first controller pass replaces the alignment vector. */
+static void FOC_CurrentTest_Begin(void)
+{
+    FOC_ResetControl();
+    id_ref = 0.0f;
+    iq_ref = 0.0f;
+    foc_stop_request = 0U;
+
+    foc_current_test_done = 0U;
+    current_test_timeout_hit = 0U;
+    current_test_control_count = 0U;
+    current_test_peak_abs_current_a = 0.0f;
+    /* Clear any state from the previous RUN, including Hall-derived speed. */
+    speed_ref_rpm = 0.0f;
+    speed_feedback_rpm = 0.0f;
+    speed_iq_ref_a = 0.0f;
+    speed_feedback_valid = 0U;
+    speed_peak_rpm = 0.0f;
+    speed_run_hall_edges = 0U;
+    speed_steady_valid_ticks = 0U;
+    speed_steady_rpm_sum = 0.0f;
+    speed_loop_update_count = 0U;
+    speed_loop_next_ms = SPEED_LOOP_PERIOD_MS;
+    speed_profile_phase = 0U;
+    for (uint32_t i = 0U; i < 3U; ++i)
+    {
+        speed_phase_sum_rpm[i] = 0.0f;
+        speed_phase_abs_error_sum_rpm[i] = 0.0f;
+        speed_phase_valid_ticks[i] = 0U;
+    }
+    hall_pred_edge_err_count = 0U;
+    hall_pred_old_err_deg_last = 0.0f;
+    hall_pred_new_err_deg_last = 0.0f;
+    hall_pred_old_err_deg_max = 0.0f;
+    hall_pred_new_err_deg_max = 0.0f;
+    hall_pred_old_err_deg_sum = 0.0f;
+    hall_pred_new_err_deg_sum = 0.0f;
+    /* Rebuild acceleration history from Hall intervals measured during RUN. */
+    hall_pred_have_prev_interval = 0U;
+    hall_pred_ready = 0U;
+    hall_pred_direction = HALL_DIR_UNKNOWN;
+    hall_pred_omega_edge_e = 0.0f;
+    hall_pred_accel_e = 0.0f;
+    current_test_peak_voltage_v = 0.0f;
+    current_test_last_id_a = 0.0f;
+    current_test_last_iq_a = 0.0f;
+    current_test_avg_id_a = 0.0f;
+    current_test_avg_iq_a = 0.0f;
+    current_test_avg_iq_error_a = 0.0f;
+    current_test_steady_samples = 0U;
+    current_test_steady_limit_samples = 0U;
+    current_trace_count = 0U;
+    current_trace_dump_pending = 0U;
+    current_trace_overflow = 0U;
+    current_trace_next_ms = CURRENT_TRACE_PERIOD_MS;
+    current_trace_block_count = 0U;
+    current_trace_id_sum = 0.0f;
+    current_trace_iq_sum = 0.0f;
+    current_trace_ref_sum = 0.0f;
+    current_trace_vd_sum = 0.0f;
+    current_trace_vq_sum = 0.0f;
+    current_trace_integral_sum = 0.0f;
+    current_trace_iq_min = 0.0f;
+    current_trace_iq_max = 0.0f;
+    current_test_sum_id_a = 0.0f;
+    current_test_sum_iq_a = 0.0f;
+    current_test_sum_iq_error_a = 0.0f;
+    current_test_hall_edge_start = hall_edge_count;
+    current_test_hall_edge_delta = 0U;
+    current_test_ccer_snapshot = TIM1->CCER & 0x0555U;
+    current_test_moe_snapshot = (TIM1->BDTR & TIM_BDTR_MOE) ? 1U : 0U;
+    current_test_start_ms = HAL_GetTick();
+}
+
+/* Runs at ~100 Hz from the existing ADC ISR; no new hardware timer.
+ * The speed PI emits ONLY a bounded Iq reference, never a PWM voltage.
+ * Raw Hall speed can contain a value inherited from alignment, so we
+ * trust feedback only after >=2 adjacent Hall transitions DURING this RUN. */
+static void FOC_SpeedLoop_Update(uint32_t elapsed_ms)
+{
+    uint32_t now;
+    uint32_t age;
+    float fb;
+    float target;
+
+    if (elapsed_ms < speed_loop_next_ms)
+        return;
+    speed_loop_next_ms = elapsed_ms + SPEED_LOOP_PERIOD_MS;
+    speed_loop_update_count++;
+    now = HAL_GetTick();
+    age = (uint32_t)(now - hall_last_edge_ms);
+
+    if ((speed_run_hall_edges >= 2U) &&
+        (hall_speed_valid != 0U) &&
+        (age <= SPEED_LOOP_STALE_MS))
+    {
+        float raw_rpm = hall_speed_rpm;
+        if (speed_feedback_valid == 0U)
+            speed_feedback_rpm = raw_rpm;
+        else
+            speed_feedback_rpm += SPEED_LOOP_FILTER_ALPHA *
+                                  (raw_rpm - speed_feedback_rpm);
+        speed_feedback_valid = 1U;
+    }
+    else
+    {
+        /* Do NOT feed stale Hall speed to the outer PI. */
+        speed_feedback_valid = 0U;
+        speed_feedback_rpm = 0.0f;
+        if (((speed_run_hall_edges >= 2U) &&
+             (age > SPEED_LOOP_STALE_MS)) ||
+            ((speed_run_hall_edges < 2U) &&
+             (elapsed_ms >= SPEED_LOOP_NO_EDGE_MS)))
+        {
+            iq_ref = 0.0f;
+            speed_iq_ref_a = 0.0f;
+            FOC_TriggerFault(FOC_FAULT_HALL_INVALID);
+            return;
+        }
+    }
+
+    /* Generate the speed profile inside the existing 100Hz outer loop.
+     * No new timer, no UART and no changes to the 20kHz current controller. */
+    if (elapsed_ms < SPEED_LOOP_ZERO_MS)
+        target = 0.0f;
+    else if (elapsed_ms < SPEED_LOOP_ZERO_MS + SPEED_LOOP_RAMP_MS)
+        target = SPEED_DYN_FIRST_RPM *
+                 (float)(elapsed_ms - SPEED_LOOP_ZERO_MS) /
+                 (float)SPEED_LOOP_RAMP_MS;
+    else if (elapsed_ms < SPEED_DYN_UP_START_MS)
+        target = SPEED_DYN_FIRST_RPM;
+    else if (elapsed_ms < SPEED_DYN_UP_START_MS + SPEED_DYN_UP_RAMP_MS)
+        target = SPEED_DYN_FIRST_RPM +
+                 (SPEED_DYN_SECOND_RPM - SPEED_DYN_FIRST_RPM) *
+                 (float)(elapsed_ms - SPEED_DYN_UP_START_MS) /
+                 (float)SPEED_DYN_UP_RAMP_MS;
+    else if (elapsed_ms < SPEED_DYN_DOWN_START_MS)
+        target = SPEED_DYN_SECOND_RPM;
+    else if (elapsed_ms < SPEED_DYN_DOWN_START_MS + SPEED_DYN_DOWN_RAMP_MS)
+        target = SPEED_DYN_SECOND_RPM +
+                 (SPEED_DYN_FINAL_RPM - SPEED_DYN_SECOND_RPM) *
+                 (float)(elapsed_ms - SPEED_DYN_DOWN_START_MS) /
+                 (float)SPEED_DYN_DOWN_RAMP_MS;
+    else
+        target = SPEED_DYN_FINAL_RPM;
+
+    speed_profile_phase = (elapsed_ms < SPEED_DYN_UP_START_MS) ? 0U :
+                          ((elapsed_ms < SPEED_DYN_DOWN_START_MS) ? 1U : 2U);
+    speed_ref_rpm = target;
+    fb = speed_feedback_rpm;
+    if (target <= 0.0f)
+    {
+        PI_Reset(&pi_speed);
+        speed_iq_ref_a = 0.0f;
+    }
+    else
+    {
+        speed_iq_ref_a = PI_Run(&pi_speed, target, fb,
+                                SPEED_LOOP_PERIOD_MS * 0.001f);
+        /* Redundant sanity bounds, independently of PI_Init bounds. */
+        if (speed_iq_ref_a < 0.0f) speed_iq_ref_a = 0.0f;
+        if (speed_iq_ref_a > SPEED_LOOP_IQ_MAX_A)
+            speed_iq_ref_a = SPEED_LOOP_IQ_MAX_A;
+    }
+    iq_ref = speed_iq_ref_a;
+
+    if ((speed_feedback_valid != 0U) && (fb > speed_peak_rpm))
+        speed_peak_rpm = fb;
+    if ((elapsed_ms >= CURRENT_TEST_STEADY_MS) &&
+        (speed_feedback_valid != 0U))
+    {
+        speed_steady_rpm_sum += fb;
+        speed_steady_valid_ticks++;
+    }
+
+    /* Final 1s of each stage, excluding both acceleration ramps. */
+    if (speed_feedback_valid != 0U)
+    {
+        int8_t phase_idx = -1;
+        float phase_target = 0.0f;
+        if ((elapsed_ms >= SPEED_DYN_PHASE0_STATS_MS) &&
+            (elapsed_ms < SPEED_DYN_UP_START_MS))
+        {
+            phase_idx = 0;
+            phase_target = SPEED_DYN_FIRST_RPM;
+        }
+        else if ((elapsed_ms >= SPEED_DYN_PHASE1_STATS_MS) &&
+                 (elapsed_ms < SPEED_DYN_DOWN_START_MS))
+        {
+            phase_idx = 1;
+            phase_target = SPEED_DYN_SECOND_RPM;
+        }
+        else if (elapsed_ms >= SPEED_DYN_PHASE2_STATS_MS)
+        {
+            phase_idx = 2;
+            phase_target = SPEED_DYN_FINAL_RPM;
+        }
+        if (phase_idx >= 0)
+        {
+            uint8_t i = (uint8_t)phase_idx;
+            speed_phase_sum_rpm[i] += fb;
+            speed_phase_abs_error_sum_rpm[i] += fabsf(phase_target - fb);
+            speed_phase_valid_ticks[i]++;
+        }
+    }
+}
+
+/* Called at 20 kHz only in RUN, AFTER PI voltage limiting.
+ * No UART, no printf, no HAL_Delay in the control interrupt. */
+static void FOC_CurrentTrace_Collect(uint32_t elapsed_ms)
+{
+    if (current_trace_block_count == 0U)
+    {
+        current_trace_iq_min = i_dq.q;
+        current_trace_iq_max = i_dq.q;
+    }
+    else
+    {
+        if (i_dq.q < current_trace_iq_min) current_trace_iq_min = i_dq.q;
+        if (i_dq.q > current_trace_iq_max) current_trace_iq_max = i_dq.q;
+    }
+
+    current_trace_block_count++;
+    current_trace_ref_sum += iq_ref;
+    current_trace_id_sum += i_dq.d;
+    current_trace_iq_sum += i_dq.q;
+    current_trace_vd_sum += vd_cmd;
+    current_trace_vq_sum += vq_cmd;
+    current_trace_integral_sum += pi_iq.integral;
+
+    if (elapsed_ms < current_trace_next_ms)
+        return;
+
+    if (current_trace_count < CURRENT_TRACE_MAX_SAMPLES)
+    {
+        uint32_t idx = current_trace_count;
+        float inv_n = 1.0f / (float)current_trace_block_count;
+        current_trace[idx].t_ms = (uint16_t)elapsed_ms;
+        current_trace[idx].hall_sector = hall_sector;
+        current_trace[idx].hall_speed_valid = hall_speed_valid;
+        current_trace[idx].iq_ref_a = current_trace_ref_sum * inv_n;
+        current_trace[idx].id_avg_a = current_trace_id_sum * inv_n;
+        current_trace[idx].iq_avg_a = current_trace_iq_sum * inv_n;
+        current_trace[idx].iq_min_a = current_trace_iq_min;
+        current_trace[idx].iq_max_a = current_trace_iq_max;
+        current_trace[idx].vd_avg_v = current_trace_vd_sum * inv_n;
+        current_trace[idx].vq_avg_v = current_trace_vq_sum * inv_n;
+        current_trace[idx].iq_integral_avg_v = current_trace_integral_sum * inv_n;
+        current_trace[idx].hall_rpm = hall_speed_rpm;
+        current_trace[idx].theta_e_rad = theta_e_foc;
+        current_trace[idx].theta_legacy_rad = WrapAngle0To2Pi(
+            hall_theta_legacy_rel + hall_offset_test_rad);
+        current_trace[idx].edge_old_err_deg = hall_pred_old_err_deg_last;
+        current_trace[idx].edge_new_err_deg = hall_pred_new_err_deg_last;
+        current_trace[idx].speed_ref_rpm = speed_ref_rpm;
+        current_trace[idx].speed_feedback_rpm = speed_feedback_rpm;
+        current_trace[idx].speed_feedback_valid = speed_feedback_valid;
+        current_trace[idx].speed_profile_phase = speed_profile_phase;
+        current_trace_count = idx + 1U; /* Publish ONLY when record is complete. */
+    }
+    else
+    {
+        current_trace_overflow = 1U;
+    }
+
+    current_trace_block_count = 0U;
+    current_trace_id_sum = 0.0f;
+    current_trace_iq_sum = 0.0f;
+    current_trace_ref_sum = 0.0f;
+    current_trace_vd_sum = 0.0f;
+    current_trace_vq_sum = 0.0f;
+    current_trace_integral_sum = 0.0f;
+    current_trace_next_ms += CURRENT_TRACE_PERIOD_MS;
+}
+
+/* Called by the main loop ONLY in READY, after RUN's three-phase PWM is off.
+ * CSV can be copied straight from a 115200-baud UART terminal. */
+static void FOC_CurrentTrace_DumpUART(void)
+{
+    char line[256];
+    int len;
+    uint32_t count = current_trace_count;
+    if (count > CURRENT_TRACE_MAX_SAMPLES)
+        count = CURRENT_TRACE_MAX_SAMPLES;
+
+    const char *marker = "TRACE_BEGIN\r\n";
+    const char *header =
+        "t_ms,iq_ref,id_avg,iq_avg,iq_min,iq_max,vd_avg,vq_avg,iq_integ,hall_rpm,theta_rad,hall_sector,hall_speed_valid,theta_old_rad,edge_old_err_deg,edge_new_err_deg,speed_ref_rpm,speed_fb_rpm,speed_fb_valid,speed_phase\r\n";
+    HAL_UART_Transmit(&huart3, (uint8_t *)marker,
+                      (uint16_t)strlen(marker), HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart3, (uint8_t *)header,
+                      (uint16_t)strlen(header), HAL_MAX_DELAY);
+    for (uint32_t j = 0U; j < count; j++)
+    {
+        /* Snapshot once: the PWM is already off and no ISR changes this array. */
+        const volatile CurrentTraceSample_t *p = &current_trace[j];
+        len = snprintf(line, sizeof(line),
+                       "%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.4f,%d,%u,%.4f,%.2f,%.2f,%.2f,%.2f,%u,%u\r\n",
+                       (unsigned)p->t_ms,
+                       (double)p->iq_ref_a,
+                       (double)p->id_avg_a,
+                       (double)p->iq_avg_a,
+                       (double)p->iq_min_a,
+                       (double)p->iq_max_a,
+                       (double)p->vd_avg_v,
+                       (double)p->vq_avg_v,
+                       (double)p->iq_integral_avg_v,
+                       (double)p->hall_rpm,
+                       (double)p->theta_e_rad,
+                       (int)p->hall_sector,
+                       (unsigned)p->hall_speed_valid,
+                       (double)p->theta_legacy_rad,
+                       (double)p->edge_old_err_deg,
+                       (double)p->edge_new_err_deg,
+                       (double)p->speed_ref_rpm,
+                       (double)p->speed_feedback_rpm,
+                       (unsigned)p->speed_feedback_valid,
+                       (unsigned)p->speed_profile_phase);
+        if ((len > 0) && (len < (int)sizeof(line)))
+            HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                              (uint16_t)len, HAL_MAX_DELAY);
+    }
+    len = snprintf(line, sizeof(line), "TRACE_END,count=%lu,overflow=%u\r\n",
+                   (unsigned long)count, (unsigned)current_trace_overflow);
+    if ((len > 0) && (len < (int)sizeof(line)))
+        HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                          (uint16_t)len, HAL_MAX_DELAY);
+    len = snprintf(line, sizeof(line),
+                   "SPEED_SUMMARY,ref=%.1f,avg=%.2f,peak=%.2f,iq_ref=%.4f,valid_ticks=%lu,updates=%lu,hall_edges=%lu,fault=%u\r\n",
+                   (double)SPEED_DYN_FINAL_RPM,
+                   (double)((speed_steady_valid_ticks > 0U) ?
+                            speed_steady_rpm_sum / (float)speed_steady_valid_ticks : 0.0f),
+                   (double)speed_peak_rpm,
+                   (double)speed_iq_ref_a,
+                   (unsigned long)speed_steady_valid_ticks,
+                   (unsigned long)speed_loop_update_count,
+                   (unsigned long)speed_run_hall_edges,
+                   (unsigned)foc_fault_code);
+    if ((len > 0) && (len < (int)sizeof(line)))
+        HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                          (uint16_t)len, HAL_MAX_DELAY);
+    /* 3 comparable last-1-second stage metrics, each from 100Hz samples. */
+    for (uint32_t i = 0U; i < 3U; ++i)
+    {
+        float stage_target = (i == 1U) ? SPEED_DYN_SECOND_RPM :
+                             ((i == 0U) ? SPEED_DYN_FIRST_RPM : SPEED_DYN_FINAL_RPM);
+        uint32_t n = speed_phase_valid_ticks[i];
+        float average = (n != 0U) ? (speed_phase_sum_rpm[i] / (float)n) : 0.0f;
+        float mae = (n != 0U) ? (speed_phase_abs_error_sum_rpm[i] / (float)n) : 0.0f;
+        len = snprintf(line, sizeof(line),
+                       "SPEED_PHASE,phase=%lu,ref=%.1f,avg=%.2f,mae=%.2f,valid_ticks=%lu\r\n",
+                       (unsigned long)i, (double)stage_target,
+                       (double)average, (double)mae, (unsigned long)n);
+        if ((len > 0) && (len < (int)sizeof(line)))
+            HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                              (uint16_t)len, HAL_MAX_DELAY);
+    }
+    /* Last and max Hall-boundary residuals are measured on complete sectors. */
+    if (hall_pred_edge_err_count > 0U)
+    {
+        float inv = 1.0f / (float)hall_pred_edge_err_count;
+        len = snprintf(line, sizeof(line),
+                       "HALL_EDGE_AB,n=%lu,old_mean=%.2f,new_mean=%.2f,old_max=%.2f,new_max=%.2f\r\n",
+                       (unsigned long)hall_pred_edge_err_count,
+                       (double)(hall_pred_old_err_deg_sum * inv),
+                       (double)(hall_pred_new_err_deg_sum * inv),
+                       (double)hall_pred_old_err_deg_max,
+                       (double)hall_pred_new_err_deg_max);
+        if ((len > 0) && (len < (int)sizeof(line)))
+            HAL_UART_Transmit(&huart3, (uint8_t *)line,
+                              (uint16_t)len, HAL_MAX_DELAY);
+    }
+}
+
+/* Convert angle into [-pi, +pi).  The difference of two angles must
+ * be wrapped before comparing them; e.g. 359 degrees vs 1 degree. */
+static float HallCalib_WrapMinusPiToPi(float angle)
+{
+    while (angle >= PI_F) angle -= TWO_PI_F;
+    while (angle < -PI_F) angle += TWO_PI_F;
+    return angle;
+}
+
+/* This is called from the TIM4 Hall capture interrupt, not from ADC.
+ * Each legal Hall transition defines an ELECTRICAL sector boundary. */
+static void HallCalib_OnHallEdge(int8_t new_sector)
+{
+    int8_t expected;
+    float hall_boundary;
+    float delta;
+    uint32_t now;
+
+    if (hall_calib_collect_enabled == 0U ||
+        foc_state != FOC_STATE_OPEN_LOOP ||
+        HALL_CALIB_MODE == 0U)
+    {
+        return;
+    }
+
+    /* Track last Hall state during acceleration; collect only after ramp. */
+    if (open_loop_tick_count < OPEN_LOOP_RAMP_TICKS)
+    {
+        hall_calib_last_sector = new_sector;
+        return;
+    }
+
+    if (new_sector < 0 || new_sector > 5 ||
+        hall_calib_last_sector < 0 || hall_calib_last_sector > 5)
+    {
+        hall_calib_pass_rejects++;
+        hall_calib_last_sector = new_sector;
+        return;
+    }
+
+    expected = (hall_calib_run_direction > 0)
+        ? (int8_t)((hall_calib_last_sector + 1) % 6)
+        : (int8_t)((hall_calib_last_sector + 5) % 6);
+
+    if (new_sector != expected)
+    {
+        hall_calib_pass_rejects++;
+        /* A repeated Hall capture is not a genuine new Hall sector. */
+        if (new_sector != hall_calib_last_sector)
+        {
+            hall_calib_last_sector = new_sector;
+        }
+        return;
+    }
+
+    now = HAL_GetTick();
+    if (hall_calib_pass_samples > 0U &&
+        (uint32_t)(now - hall_calib_last_accepted_ms) < HALL_CALIB_MIN_EDGE_MS)
+    {
+        hall_calib_pass_rejects++;
+        return;
+    }
+    hall_calib_last_accepted_ms = now;
+    hall_calib_last_sector = new_sector;
+
+    /* CW enters sector j at j*60deg; CCW enters it at (j+1)*60deg. */
+    hall_boundary = (hall_calib_run_direction > 0)
+        ? ((float)new_sector * HALL_SECTOR_ANGLE_RAD)
+        : ((float)(new_sector + 1) * HALL_SECTOR_ANGLE_RAD);
+
+    /* theta_command ~= theta_rotor + signed torque/load angle.
+     * If theta_rotor = theta_hall + offset, then the following difference
+     * is an offset estimate plus a direction-dependent lag. */
+    delta = HallCalib_WrapMinusPiToPi(open_loop_theta_e - hall_boundary);
+    hall_calib_sum_sin += sinf(delta);
+    hall_calib_sum_cos += cosf(delta);
+    hall_calib_pass_samples++;
+}
+
+/* Run in the MAIN LOOP only, AFTER PWM has been disabled. */
+static void HallCalib_FinishPass(void)
+{
+    float pass_offset;
+    float sx, cx;
+
+    if (hall_calib_stage == 0U)
+    {
+        hall_calib_cw_samples = hall_calib_pass_samples;
+        hall_calib_cw_rejects = hall_calib_pass_rejects;
+    }
+    else if (hall_calib_stage == 1U)
+    {
+        hall_calib_ccw_samples = hall_calib_pass_samples;
+        hall_calib_ccw_rejects = hall_calib_pass_rejects;
+    }
+    else
+    {
+        return;
+    }
+
+    /* Reject untrustworthy results; do not auto-apply a guessed offset. */
+    if (hall_calib_pass_samples < HALL_CALIB_MIN_SAMPLES ||
+        hall_calib_pass_samples > HALL_CALIB_MAX_SAMPLES)
+    {
+        hall_calib_status = 3U;
+        return;
+    }
+    if (hall_calib_pass_rejects > HALL_CALIB_MAX_REJECTS)
+    {
+        hall_calib_status = 4U;
+        return;
+    }
+
+    pass_offset = atan2f(hall_calib_sum_sin, hall_calib_sum_cos);
+    if (hall_calib_stage == 0U)
+    {
+        hall_calib_cw_rad = WrapAngle0To2Pi(pass_offset);
+        hall_calib_stage = 1U;     /* next SW3 starts a reverse pass */
+        hall_calib_status = 1U;
+        return;
+    }
+
+    hall_calib_ccw_rad = WrapAngle0To2Pi(pass_offset);
+    hall_calib_direction_diff_rad = fabsf(HallCalib_WrapMinusPiToPi(
+        hall_calib_cw_rad - hall_calib_ccw_rad));
+    if (hall_calib_direction_diff_rad > HALL_CALIB_MAX_DIR_DIFF_RAD)
+    {
+        hall_calib_status = 5U;
+        return;
+    }
+
+    /* Circular mean of CW and CCW estimates: cancels much of the
+     * speed-dependent lead/lag for symmetric no-load operation. */
+    sx = sinf(hall_calib_cw_rad) + sinf(hall_calib_ccw_rad);
+    cx = cosf(hall_calib_cw_rad) + cosf(hall_calib_ccw_rad);
+    hall_calib_offset_est_rad = WrapAngle0To2Pi(atan2f(sx, cx));
+    hall_calib_valid = 1U;
+    hall_calib_stage = 2U;
+    hall_calib_status = 2U;
+
+    /* Do not overwrite hall_offset_test_rad or enter closed-loop RUN yet. */
+}
+
+static void FOC_AlignTest_Calculate(void)
+{
+    float v_alpha = ALIGN_TEST_V_ALPHA_V;
+    float v_beta  = 0.0f;
+
+    SVPWM_Output_t result = {0};
+
+    /* Fixed alpha-axis voltage vector */
+    SVPWM_LimitVoltage(
+        &v_alpha,
+        &v_beta,
+        vdc_bus
+    );
+
+    SVPWM_Run(
+        v_alpha,
+        v_beta,
+        vdc_bus,
+        &result
+    );
+
+    /* Save calculated duty values */
+    align_test_duty_u = result.duty_u;
+    align_test_duty_v = result.duty_v;
+    align_test_duty_w = result.duty_w;
+
+    /* Calculate CCR values for observation */
+    align_test_ccr_u = DutyToCCR(result.duty_u);
+    align_test_ccr_v = DutyToCCR(result.duty_v);
+    align_test_ccr_w = DutyToCCR(result.duty_w);
+
+    align_test_calc_count++;
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_USART3_UART_Init();
+  MX_TIM6_Init();
+  MX_TIM4_Init();
+  MX_ADC1_Init();
+  MX_OPAMP1_Init();
+  MX_ADC2_Init();
+  MX_OPAMP2_Init();
+  MX_TIM1_Init();
+  /* USER CODE BEGIN 2 */
+
+  theta_e_step = 6.283185307f / 20000.0f;
+
+  /* First real current-loop experiment: conservative trial PI gains.
+   * Not a final motor-specific tuning. */
+  PI_Init(&pi_id,
+          CURRENT_TEST_PI_KP,
+          CURRENT_TEST_PI_KI,
+          -CURRENT_TEST_PI_LIMIT_V,
+          CURRENT_TEST_PI_LIMIT_V);
+
+  PI_Init(&pi_iq,
+          CURRENT_TEST_PI_KP,
+          CURRENT_TEST_PI_KI,
+          -CURRENT_TEST_PI_LIMIT_V,
+          CURRENT_TEST_PI_LIMIT_V);
+
+  PI_Init(&pi_speed,
+          SPEED_LOOP_PI_KP,
+          SPEED_LOOP_PI_KI,
+          0.0f,
+          SPEED_LOOP_IQ_MAX_A);
+
+  FOC_ResetControl();
+  FOC_SetNeutralPWM();
+
+  current_offset_done  = 0;
+  current_offset_count = 0;
+
+  iu_offset_sum = 0;
+  iv_offset_sum = 0;
+  foc_state = FOC_STATE_CALIBRATION;  //init之后statemanager进入calibration
+
+  /* 启动U相电流采样运suan */
+  HAL_OPAMP_Start(&hopamp1);//和之前学PWM时一样，init后要start，要不然不会报错，但是结果不dui
+  HAL_OPAMP_Start(&hopamp2);
+
+  /* ADC校准 */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);  //校准
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+
+  /* 启动双tong道ADC + DMA */
+  HAL_ADC_Start_DMA(&hadc1,
+                    (uint32_t *)&vdc_adc_raw,
+                    1);
+
+  /* 当前实验不需要DMA完成中断 */
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT); //这两行代码是为了防止频繁DMA中断导致主程序几乎不能运xing
+  __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
+
+  HAL_ADCEx_InjectedStart_IT(&hadc2);
+  HAL_ADCEx_InjectedStart_IT(&hadc1);
+
+  /*
+   * TIM1 CH1/2/3:
+   * 已完成PWM配置，但暂不启动三相功率输出�??
+   *
+   * TIM1 CH4:
+   * 仅用于触发ADC同步电流采样�??
+   */
+  FOC_PWM_Disable();
+
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* Ensure all three phase outputs remain disabled */
+  FOC_PWM_Disable();
+
+  HAL_TIM_Base_Start_IT(&htim6); //Start TIM6 and allow it to work in interrupt mode.
+
+  if (HAL_TIMEx_HallSensor_Start_IT(&htim4) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* Read initial Hall state */
+  Hall_UpdateState();
+  hall_sector =
+      Hall_StateToSector(hall_state);
+
+
+
+
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	    //HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_4);
+	    //HAL_Delay(500); //LED test
+
+	  /* Check SW3 button */
+	  FOC_CheckStartButton();
+
+	  /* Process FOC state transitions */
+	  FOC_StateManager();
+
+	  /* Hall timeout monitoring */
+	  Hall_CheckTimeout();
+
+
+
+
+	  /* Only in foreground, not in the 20kHz ADC interrupt. */
+	  static uint32_t last_vofa_ms = 0U;
+
+	  uint32_t now_ms = HAL_GetTick();
+
+	  if ((uint32_t)(now_ms - last_vofa_ms) >= 10U)
+	  {
+	      last_vofa_ms = now_ms;
+
+	      (void)VOFA_Stream_TrySend(
+	    		    speed_ref_rpm,
+	    		    speed_feedback_rpm,
+	    		    iq_ref,
+	    		    i_dq.q,
+	    		    vdc_bus);
+	  }
+
+      /* Print data only AFTER the completed current test has disabled PWM.
+       * Never perform UART output from the 20 kHz ADC interrupt. */
+      if ((current_trace_dump_pending != 0U) &&
+          ((foc_state == FOC_STATE_READY) ||
+           (foc_state == FOC_STATE_FAULT)))
+      {
+          current_trace_dump_pending = 0U;
+          // FOC_CurrentTrace_DumpUART();  // VOFA模式下暂时禁用CSV串口输出
+      }
+
+
+	  /*  if (hall_uart_pending)
+	  {
+	      uint8_t state;
+	      uint32_t capture;
+	      // uint32_t edge; //边沿次数 之前为了算电机极对数使用�???
+
+	      hall_uart_pending = 0;
+
+
+	      state = hall_report_state;
+
+	      capture = hall_report_capture;
+
+	      //edge = hall_report_edge_count;
+
+	      float hall_dt_ms =
+	          (float)capture
+	          * HALL_TIMER_TICK_S
+	          * 1000.0f;
+
+	      const char *dir_str;
+
+	      if (hall_direction == HALL_DIR_CW)
+	      {
+	          dir_str = "CW";
+	      }
+	      else if (hall_direction == HALL_DIR_CCW)
+	      {
+	          dir_str = "CCW";
+	      }
+	      else
+	      {
+	          dir_str = "UNKNOWN";
+	      }*/
+
+	      /* int len =
+	          snprintf(tx_buffer,
+	                   sizeof(tx_buffer),
+	                   "HALL:%u%u%u Sector=%d Dir=%s dt=%.2fms RPM=%.1f We=%.2f Valid=%u\r\n",
+	                   (state >> 2) & 0x01,
+	                   (state >> 1) & 0x01,
+	                   state & 0x01,
+	                   (int)hall_sector,
+	                   dir_str,
+	                   hall_dt_ms,
+	                   hall_speed_rpm,
+	                   hall_omega_e,
+	                   hall_speed_valid);*/
+	  /* int len =
+	          snprintf(tx_buffer,
+	                   sizeof(tx_buffer),
+	                   "ThetaHall=%.3f Sector=%d RPM=%.1f We=%.2f Valid=%u\r\n",
+	                   hall_theta_rel,
+	                   (int)hall_sector,
+	                   hall_speed_rpm,
+	                   hall_omega_e,
+	                   hall_angle_valid);
+
+
+	      HAL_UART_Transmit(&huart3,
+	                        (uint8_t *)tx_buffer,
+	                        len,
+	                        HAL_MAX_DELAY);
+	  }*/
+
+	  /* Hall electrical angle offset test: UART output */
+	  /* Hall FOC electrical angle UART test */
+      /*  if ((foc_state != FOC_STATE_ALIGN_ACTIVE) &&
+          ((uint32_t)(HAL_GetTick() - angle_uart_last_ms) >= 100U))
+	  {
+	      angle_uart_last_ms = HAL_GetTick();
+
+	      //Latest open-loop debug values persist after the automatic stop.
+	      int len = snprintf(
+	          tx_buffer,
+	          sizeof(tx_buffer),
+	          "St=%d Cmd=%.1f Hall=%.1f Ed=%lu Ipk=%.3f Done=%u Fault=%d\r\n",
+	          (int)foc_state,
+	          open_loop_speed_cmd_rpm,
+	          open_loop_last_hall_rpm,
+	          (unsigned long)open_loop_hall_edge_delta,
+	          open_loop_peak_current_a,
+	          (unsigned int)foc_open_loop_done,
+	          (int)foc_fault_code
+	      );
+
+	      if ((len > 0) && (len < (int)sizeof(tx_buffer)))
+	      {
+	          HAL_UART_Transmit(
+	              &huart3,
+	              (uint8_t *)tx_buffer,
+	              (uint16_t)len,
+	              HAL_MAX_DELAY
+	          );
+	      }
+	  }*/
+
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_InjectionConfTypeDef sConfigInjected = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Injected Channel
+  */
+  sConfigInjected.InjectedChannel = ADC_CHANNEL_3;
+  sConfigInjected.InjectedRank = ADC_INJECTED_RANK_1;
+  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfigInjected.InjectedSingleDiff = ADC_SINGLE_ENDED;
+  sConfigInjected.InjectedOffsetNumber = ADC_OFFSET_NONE;
+  sConfigInjected.InjectedOffset = 0;
+  sConfigInjected.InjectedNbrOfConversion = 1;
+  sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
+  sConfigInjected.AutoInjectedConv = DISABLE;
+  sConfigInjected.QueueInjectedContext = DISABLE;
+  sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJEC_T1_CC4;
+  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_RISING;
+  sConfigInjected.InjecOversamplingMode = DISABLE;
+  if (HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConfigInjected) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_InjectionConfTypeDef sConfigInjected = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc2.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.GainCompensation = 0;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc2.Init.LowPowerAutoWait = DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.NbrOfConversion = 1;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.DMAContinuousRequests = DISABLE;
+  hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc2.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Injected Channel
+  */
+  sConfigInjected.InjectedChannel = ADC_CHANNEL_3;
+  sConfigInjected.InjectedRank = ADC_INJECTED_RANK_1;
+  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfigInjected.InjectedSingleDiff = ADC_SINGLE_ENDED;
+  sConfigInjected.InjectedOffsetNumber = ADC_OFFSET_NONE;
+  sConfigInjected.InjectedOffset = 0;
+  sConfigInjected.InjectedNbrOfConversion = 1;
+  sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
+  sConfigInjected.AutoInjectedConv = DISABLE;
+  sConfigInjected.QueueInjectedContext = DISABLE;
+  sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJEC_T1_CC4;
+  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_RISING;
+  sConfigInjected.InjecOversamplingMode = DISABLE;
+  if (HAL_ADCEx_InjectedConfigChannel(&hadc2, &sConfigInjected) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief OPAMP1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP1_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP1_Init 0 */
+
+  /* USER CODE END OPAMP1_Init 0 */
+
+  /* USER CODE BEGIN OPAMP1_Init 1 */
+
+  /* USER CODE END OPAMP1_Init 1 */
+  hopamp1.Instance = OPAMP1;
+  hopamp1.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp1.Init.Mode = OPAMP_STANDALONE_MODE;
+  hopamp1.Init.InvertingInput = OPAMP_INVERTINGINPUT_IO0;
+  hopamp1.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp1.Init.InternalOutput = DISABLE;
+  hopamp1.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp1.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP1_Init 2 */
+
+  /* USER CODE END OPAMP1_Init 2 */
+
+}
+
+/**
+  * @brief OPAMP2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP2_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP2_Init 0 */
+
+  /* USER CODE END OPAMP2_Init 0 */
+
+  /* USER CODE BEGIN OPAMP2_Init 1 */
+
+  /* USER CODE END OPAMP2_Init 1 */
+  hopamp2.Instance = OPAMP2;
+  hopamp2.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp2.Init.Mode = OPAMP_STANDALONE_MODE;
+  hopamp2.Init.InvertingInput = OPAMP_INVERTINGINPUT_IO0;
+  hopamp2.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp2.Init.InternalOutput = DISABLE;
+  hopamp2.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp2.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP2_Init 2 */
+
+  /* USER CODE END OPAMP2_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
+  htim1.Init.Period = 4249;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 2125;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
+  sConfigOC.Pulse = 4248;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  __HAL_TIM_DISABLE_OCxPRELOAD(&htim1, TIM_CHANNEL_4);
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 85;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_HallSensor_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 1699;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 65535;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.Commutation_Delay = 0;
+  if (HAL_TIMEx_HallSensor_Init(&htim4, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC2REF;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 169;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : START_BTN_Pin */
+  GPIO_InitStruct.Pin = START_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(START_BTN_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LED1_Pin */
+  GPIO_InitStruct.Pin = LED1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED1_GPIO_Port, &GPIO_InitStruct);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)
+    {
+        /* Allow up to 20 ms for ALIGN -> OPEN_LOOP handoff.
+         * The TIM6 hard cutoff remains independent of blocking UART calls. */
+        if ((foc_state == FOC_STATE_ALIGN_ACTIVE) &&
+            (uint32_t)(HAL_GetTick() - align_active_start_ms) >=
+                (ALIGN_ACTIVE_MS +
+                 (((OPEN_LOOP_AFTER_ALIGN != 0U) ||
+                   (CURRENT_TEST_AFTER_ALIGN != 0U))
+                      ? ALIGN_TO_OPENLOOP_GRACE_MS : 0U)))
+        {
+            FOC_PWM_Disable();
+        }
+        if ((foc_state == FOC_STATE_OPEN_LOOP) &&
+            ((uint32_t)(HAL_GetTick() - open_loop_start_ms) >= OPEN_LOOP_DURATION_MS))
+        {
+            /* TIM6 shutdown still runs if the main loop is delayed by UART. */
+            FOC_PWM_Disable();
+            hall_calib_collect_enabled = 0U;  /* exclude unpowered coasting edges */
+            open_loop_timeout_hit = 1U;
+        }
+        if ((foc_state == FOC_STATE_RUN) &&
+            ((uint32_t)(HAL_GetTick() - current_test_start_ms)
+             >= CURRENT_TEST_DURATION_MS))
+        {
+            FOC_PWM_Disable();
+            current_test_timeout_hit = 1U;
+        }
+        timer_counter++; //1ms 1times
+
+        if (timer_counter >= 1000) //1s
+        {
+            timer_counter = 0;
+            uart_send_flag = 1;
+        }
+    }
+}
+
+
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	adc_callback_test_count++;
+    if (hadc->Instance == ADC1)
+    {
+        iu_raw_sync =
+            HAL_ADCEx_InjectedGetValue(&hadc1,
+                                       ADC_INJECTED_RANK_1);
+
+        current_sample_ready |= 0x01; //01
+    }
+
+    if (hadc->Instance == ADC2)
+    {
+        iv_raw_sync =
+            HAL_ADCEx_InjectedGetValue(&hadc2,
+                                       ADC_INJECTED_RANK_1);
+
+        current_sample_ready |= 0x02; //10
+    }
+
+    /* U、V两相本周期数据都已经到齐 */
+    if (current_sample_ready == 0x03) // 11
+    {
+        current_sample_ready = 0;
+
+		vdc_bus =(float) vdc_adc_raw * VDC_VOLTS_PER_COUNT;  //后面 READY �???? FAULT 状�?�需要知�???? Vdc
+
+        adc_injected_count++;
+
+        /* DC bus protection */
+        FOC_CheckVdcProtection();
+
+
+        if (foc_fault_request) // 不加这个的话，真正foc_state = FOC_STATE_FAULT;要等while�????1）中的FOC_StateManager();执行之后
+        {
+            return;
+        }
+
+        /* ---------- Offset calibration ---------- */
+        if (foc_state == FOC_STATE_CALIBRATION)
+        {
+            iu_offset_sum += iu_raw_sync;
+            iv_offset_sum += iv_raw_sync;
+
+            current_offset_count++;
+
+            if (current_offset_count >= CURRENT_OFFSET_SAMPLES)
+            {
+                iu_offset_adc =
+                    (uint16_t)(iu_offset_sum / CURRENT_OFFSET_SAMPLES);
+
+                iv_offset_adc =
+                    (uint16_t)(iv_offset_sum / CURRENT_OFFSET_SAMPLES);
+
+                current_offset_done = 1;
+
+                FOC_ResetControl();
+                FOC_SetNeutralPWM();
+
+                FOC_PWM_Disable();
+
+                foc_state = FOC_STATE_READY;//after calibration state manager into ready
+            }
+            /*
+             * 很重要：
+             * CALIBRATION 状�?�做到这里就结束本次ADC回调�????
+             * 不继续算电流、Park、PI�????
+             */
+            return;
+        }
+
+        /* ==================================================
+         * 2. INIT / FAULT 状�?�直接�??�????
+         * ================================================== */
+        if ((foc_state == FOC_STATE_INIT) ||
+            (foc_state == FOC_STATE_FAULT))
+        {
+            return;
+        }
+
+        /* ---------- Current calculation ---------- */
+        /* ==================================================
+         * 3. READY �???? RUN 都允许走到这�????
+         *    �????以继续计算实际电�????
+         * ================================================== */
+
+        //standard FOC current direction e=i^*-i
+		iu_adc_delta =
+		    (int32_t)iu_offset_adc
+		    - (int32_t)iu_raw_sync;
+
+		iv_adc_delta =
+		    (int32_t)iv_offset_adc
+		    - (int32_t)iv_raw_sync;
+
+		iu_a =
+		    (float)iu_adc_delta
+		    * CURRENT_A_PER_COUNT;
+
+		iv_a =
+		    (float)iv_adc_delta
+		    * CURRENT_A_PER_COUNT;
+
+		iu_ma = (int32_t)(iu_a * 1000.0f);
+		iv_ma = (int32_t)(iv_a * 1000.0f);
+
+        if (foc_state == FOC_STATE_OPEN_LOOP)
+        {
+            float iabs = (iu_a >= 0.0f) ? iu_a : -iu_a;
+            float vabs = (iv_a >= 0.0f) ? iv_a : -iv_a;
+            float wabs = (iu_a + iv_a >= 0.0f) ? (iu_a + iv_a) : -(iu_a + iv_a);
+            if (iabs > open_loop_peak_current_a) open_loop_peak_current_a = iabs;
+            if (vabs > open_loop_peak_current_a) open_loop_peak_current_a = vabs;
+            if (wabs > open_loop_peak_current_a) open_loop_peak_current_a = wabs;
+        }
+
+        FOC_CheckOverCurrent();
+
+        if (foc_state == FOC_STATE_RUN)
+        {
+            float a = fabsf(iu_a);
+            float b = fabsf(iv_a);
+            float c = fabsf(-(iu_a + iv_a));
+            if (a > current_test_peak_abs_current_a) current_test_peak_abs_current_a = a;
+            if (b > current_test_peak_abs_current_a) current_test_peak_abs_current_a = b;
+            if (c > current_test_peak_abs_current_a) current_test_peak_abs_current_a = c;
+        }
+
+        if (foc_state == FOC_STATE_ALIGN_ACTIVE)
+        {
+            float iabs = iu_a < 0.0f ? -iu_a : iu_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+            iabs = iv_a < 0.0f ? -iv_a : iv_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+            iabs = iw_a < 0.0f ? -iw_a : iw_a;
+            if (iabs > align_max_abs_phase_current) align_max_abs_phase_current = iabs;
+        }
+
+        if (foc_fault_request)
+		{
+		    return;
+		}
+
+		/* Clarke Transform */
+		Clarke_Run(iu_a,
+				   iv_a,
+				   &i_ab);
+
+		/* Test electrical angle */ // Generally, angles are normalized to 0-2pai
+		theta_e_test += theta_e_step;
+
+		if (theta_e_test >= 6.283185307f)
+		{
+			theta_e_test -= 6.283185307f;
+		}
+
+		/* Update real Hall interpolated angle */
+		/*
+		 * 不要只在 Hall 边沿中断里运行此函数
+		 *  因为如果只在 Hall ISR 里算�??
+		 *  �??个Hall边沿 �?? 算一次角�??
+		 *  直到下一个Hall边沿 �?? 才再更新
+		 *  这仍然不是连续角度，�??以放�??20 kHz ADC 同步控制 ISR 中�??
+		 */
+		Hall_UpdateElectricalAngle();
+
+		/* Update FOC electrical angle from Hall */
+		if (hall_angle_valid)
+		{
+		    hall_theta_corrected_test =WrapAngle0To2Pi(hall_theta_rel + hall_offset_test_rad);
+
+		    theta_e_foc = hall_theta_corrected_test;
+		}
+
+
+		/* RUN状�?�下�??查Hall角度有效�?? */
+		if (((foc_state == FOC_STATE_RUN) ||
+             (foc_state == FOC_STATE_ALIGN_ACTIVE)) &&
+            (hall_angle_valid == 0U))
+		{
+		    FOC_TriggerFault(FOC_FAULT_HALL_INVALID);
+		    return;
+		}
+
+		/* Alignment software-only test */
+		if (foc_state == FOC_STATE_ALIGN_TEST)
+		{
+		    FOC_AlignTest_Calculate();
+		    return;
+		}
+
+        /* Open-loop is independent from Hall offset and bypasses current PI. */
+        if (foc_state == FOC_STATE_OPEN_LOOP)
+        {
+            open_loop_hall_edge_delta = hall_edge_count - open_loop_hall_edge_start;
+            if (hall_speed_valid)
+            {
+                open_loop_last_hall_rpm = hall_speed_rpm;
+                open_loop_last_hall_direction = (int8_t)hall_direction;
+            }
+            FOC_OpenLoop_Update();
+            return;
+        }
+
+        /* During fixed-vector alignment, do not run the current PI. */
+        if ((foc_state == FOC_STATE_ALIGN_PREPARE) ||
+            (foc_state == FOC_STATE_ALIGN_ACTIVE))
+        {
+            return;
+        }
+
+		/* Park Transform */
+		Park_Run(i_ab.alpha,
+				 i_ab.beta,
+				 theta_e_foc,
+				 &i_dq);
+
+		/* ==================================================
+		 * 4. READY 状�?�到这里停止
+		 * ================================================== */
+		if (foc_state == FOC_STATE_READY)
+		{
+			return;
+		}
+
+
+		/* ==================================================
+		 * 5. 只有 RUN 才允许继续执行PI
+		 * ================================================== */
+		if (foc_state != FOC_STATE_RUN)
+		{
+			return;
+		}
+
+        /* Timed, bounded Hall speed-outer/current-inner experiment. */
+        if (current_test_timeout_hit != 0U)
+        {
+            return;
+        }
+        uint32_t run_elapsed_ms =
+            (uint32_t)(HAL_GetTick() - current_test_start_ms);
+        if (run_elapsed_ms >= CURRENT_TEST_DURATION_MS)
+        {
+            FOC_PWM_Disable();
+            current_test_timeout_hit = 1U;
+            return;
+        }
+        if ((vdc_bus <= vdc_uv_trip) || (vdc_bus >= vdc_ov_trip))
+        {
+            FOC_TriggerFault((vdc_bus <= vdc_uv_trip)
+                ? FOC_FAULT_VDC_UNDERVOLTAGE : FOC_FAULT_VDC_OVERVOLTAGE);
+            return;
+        }
+
+        /* Outer speed PI (100 Hz) -> bounded Iq ref; inner current PI (20 kHz). */
+        id_ref = 0.0f;
+        FOC_SpeedLoop_Update(run_elapsed_ms);
+        if (foc_fault_request != 0U)
+            return;
+
+        current_test_control_count++;
+        current_test_last_id_a = i_dq.d;
+        current_test_last_iq_a = i_dq.q;
+        current_test_hall_edge_delta =
+            hall_edge_count - current_test_hall_edge_start;
+        if (run_elapsed_ms >= CURRENT_TEST_STEADY_MS)
+        {
+            current_test_sum_id_a += i_dq.d;
+            current_test_sum_iq_a += i_dq.q;
+            current_test_sum_iq_error_a += iq_ref - i_dq.q;
+            current_test_steady_samples++;
+        }
+
+		/* Current controller */
+
+		/* d-axis current PI */
+		vd_cmd =
+			PI_Run(&pi_id,
+				   id_ref,
+				   i_dq.d,
+				   CURRENT_LOOP_TS);
+		/* q-axis current PI */
+		vq_cmd =
+			PI_Run(&pi_iq,
+				   iq_ref,
+				   i_dq.q,
+				   CURRENT_LOOP_TS);
+
+
+
+        /* Limit total commanded voltage magnitude independently of SVPWM. */
+        {
+            float v2 = vd_cmd * vd_cmd + vq_cmd * vq_cmd;
+            if (v2 > CURRENT_TEST_V_LIMIT_V * CURRENT_TEST_V_LIMIT_V)
+            {
+                float scale = CURRENT_TEST_V_LIMIT_V / sqrtf(v2);
+                vd_cmd *= scale;
+                vq_cmd *= scale;
+                v2 = CURRENT_TEST_V_LIMIT_V * CURRENT_TEST_V_LIMIT_V;
+            }
+            if (sqrtf(v2) > current_test_peak_voltage_v)
+                current_test_peak_voltage_v = sqrtf(v2);
+
+            /* Same definition as the previous near-limit comparison tests. */
+            if ((run_elapsed_ms >= CURRENT_TEST_STEADY_MS) &&
+                (v2 >= (0.98f * CURRENT_TEST_V_LIMIT_V) *
+                       (0.98f * CURRENT_TEST_V_LIMIT_V)))
+            {
+                current_test_steady_limit_samples++;
+            }
+        }
+
+        /* Capture 50 ms block means, plus Iq min/max for ripple diagnosis. */
+        FOC_CurrentTrace_Collect(run_elapsed_ms);
+
+		/* Inverse Park */
+		InvPark_Run(vd_cmd,
+					vq_cmd,
+					theta_e_foc,
+					&v_ab);
+
+		/* Copy voltage command */
+		v_alpha_cmd = v_ab.alpha;
+		v_beta_cmd  = v_ab.beta;
+
+
+		/* Voltage vector limitation */
+		SVPWM_LimitVoltage(&v_alpha_cmd,
+						   &v_beta_cmd,
+						   vdc_bus);
+
+		SVPWM_Run(v_alpha_cmd,
+				  v_beta_cmd,
+				  vdc_bus,
+				  &svpwm_out);
+
+		pwm_ccr_u =
+			DutyToCCR(svpwm_out.duty_u);
+		pwm_ccr_v =
+			DutyToCCR(svpwm_out.duty_v);
+		pwm_ccr_w =
+			DutyToCCR(svpwm_out.duty_w);
+
+
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_1,
+							  pwm_ccr_u);
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_2,
+							  pwm_ccr_v);
+		__HAL_TIM_SET_COMPARE(&htim1,
+							  TIM_CHANNEL_3,
+							  pwm_ccr_w);
+    }
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM4)
+    {
+        hall_capture =
+            HAL_TIM_ReadCapturedValue(htim,
+                                      TIM_CHANNEL_1);
+
+        hall_edge_count++;
+
+
+        /* Save sector BEFORE updating it: reject non-adjacent jumps. */
+        int8_t sector_before_edge = hall_sector;
+        Hall_UpdateState();
+        hall_sector = Hall_StateToSector(hall_state);
+
+        Hall_UpdateDirection(hall_sector);
+        /* Must precede Hall_UpdateSpeed(): compare against previous speed. */
+        HallAngle_OnHallEdge(hall_capture, sector_before_edge, hall_sector);
+        Hall_UpdateSpeed(hall_capture);
+        if ((foc_state == FOC_STATE_RUN) &&
+            (sector_before_edge >= 0) &&
+            (hall_sector == (int8_t)((sector_before_edge + 1) % 6)) &&
+            (hall_direction == HALL_DIR_CW) &&
+            (hall_speed_valid != 0U))
+        {
+            speed_run_hall_edges++;
+        }
+        HallCalib_OnHallEdge(hall_sector);
+
+        /* Remember latest Hall edge time */
+        hall_last_edge_ms = HAL_GetTick();
+
+        /* Save one Hall event for UART */
+        hall_report_state =
+            hall_state;
+
+        hall_report_capture =
+            hall_capture;
+
+        hall_report_edge_count =
+            hall_edge_count;
+
+
+        hall_uart_pending = 1;
+    }
+}
+
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

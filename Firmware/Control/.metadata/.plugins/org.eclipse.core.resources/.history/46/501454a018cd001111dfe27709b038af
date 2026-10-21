@@ -1,0 +1,57 @@
+#include "vofa_stream.h"
+#include "main.h"
+#include <string.h>
+
+extern UART_HandleTypeDef huart3;
+
+/* Stage-6 diagnostic. 1 = emit literal known-good JustFloat bytes;
+ * 0 = emit the five float arguments normally.
+ * This changes ONLY telemetry, never any motor-control command. */
+#define VOFA_FIXED_BYTES_TEST 0U
+#define VOFA_CHANNELS 5U
+#define VOFA_TX_LEN ((VOFA_CHANNELS + 1U) * 4U)
+
+/* Must persist until the asynchronous DMA transfer is complete. */
+static uint8_t vofa_tx_buf[VOFA_TX_LEN];
+
+uint8_t VOFA_Stream_TrySend(float speed_ref_rpm,
+                            float speed_actual_rpm,
+                            float iq_ref_a,
+                            float iq_actual_a,
+                            float vdc_bus_v)
+{
+    if (huart3.gState != HAL_UART_STATE_READY)
+        return 0U;
+
+#if VOFA_FIXED_BYTES_TEST
+    /* 5 x IEEE-754 float32, little-endian: 10,20,0.01,0.02,24.
+     * Crucially this does not cast/copy floating point variables. */
+    static const uint8_t known_good[VOFA_TX_LEN] = {
+        0x00,0x00,0x20,0x41,  /* 10.0f */
+        0x00,0x00,0xA0,0x41,  /* 20.0f */
+        0x0A,0xD7,0x23,0x3C,  /* 0.01f */
+        0x0A,0xD7,0xA3,0x3C,  /* 0.02f */
+        0x00,0x00,0xC0,0x41,  /* 24.0f */
+        0x00,0x00,0x80,0x7F   /* VOFA JustFloat terminator */
+    };
+    (void)speed_ref_rpm;
+    (void)speed_actual_rpm;
+    (void)iq_ref_a;
+    (void)iq_actual_a;
+    (void)vdc_bus_v;
+    memcpy(vofa_tx_buf, known_good, sizeof(known_good));
+#else
+    const float values[VOFA_CHANNELS] = {
+        speed_ref_rpm, speed_actual_rpm, iq_ref_a, iq_actual_a, vdc_bus_v
+    };
+    /* STM32G431: float is 4-byte IEEE754; JustFloat demands exactly that. */
+    memcpy(vofa_tx_buf, values, sizeof(values));
+    vofa_tx_buf[20] = 0x00U;
+    vofa_tx_buf[21] = 0x00U;
+    vofa_tx_buf[22] = 0x80U;
+    vofa_tx_buf[23] = 0x7FU;
+#endif
+    return (HAL_UART_Transmit_DMA(&huart3, vofa_tx_buf,
+                                  (uint16_t)sizeof(vofa_tx_buf)) == HAL_OK)
+             ? 1U : 0U;
+}

@@ -230,6 +230,13 @@ volatile uint8_t current_oc_counter = 0;
 volatile uint32_t timer_counter = 0;
 volatile uint8_t uart_send_flag = 0;
 
+/* Stage 6B: USART3 interrupt RX diagnostics (read-only; no motor command). */
+static uint8_t uart_rx6b_byte = 0U;  /* Owned by HAL_UART_Receive_IT until callback. */
+volatile uint32_t uart_rx6b_total_count = 0U;
+volatile uint32_t uart_rx6b_ping_count = 0U;
+volatile uint32_t uart_rx6b_error_count = 0U;
+volatile uint32_t uart_rx6b_arm_fail_count = 0U;
+
 uint32_t seconds_counter = 0;
 char tx_buffer[100];    //准备发给电脑的一小块字符缓冲qu
 
@@ -2663,6 +2670,14 @@ int main(void)
   hall_sector =
       Hall_StateToSector(hall_state);
 
+  /* 6B: Start the FIRST one-byte USART3 RX interrupt here, after peripheral
+   * initialization. Further bytes are re-armed inside RxCpltCallback.
+   * Keep UART TX for binary JustFloat only; never echo ASCII here. */
+  if (HAL_UART_Receive_IT(&huart3, &uart_rx6b_byte, 1U) != HAL_OK)
+  {
+      uart_rx6b_arm_fail_count++;
+  }
+
 
 
 
@@ -2701,11 +2716,12 @@ int main(void)
 	      last_vofa_ms = now_ms;
 
 	      (void)VOFA_Stream_TrySend(
-	    		    speed_ref_rpm,
-	    		    speed_feedback_rpm,
-	    		    iq_ref,
-	    		    i_dq.q,
-	    		    vdc_bus);
+          speed_ref_rpm,
+          speed_feedback_rpm,
+          iq_ref,
+          i_dq.q,
+          vdc_bus,
+          (float)uart_rx6b_ping_count);
 	  }
 
       /* Print data only AFTER the completed current test has disabled PWM.
@@ -3362,6 +3378,35 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/* 6B: USART3 RX interrupt.  The vendor example stores each byte and re-arms
+ * HAL_UART_Receive_IT.  This adapted version recognizes only 'P' and does
+ * not send textual replies, so it cannot corrupt JustFloat DMA output.
+ * Zero motor commands are accepted in this learning stage. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART3)
+        return;
+
+    uart_rx6b_total_count++;
+    if (uart_rx6b_byte == (uint8_t)'P')
+        uart_rx6b_ping_count++;
+
+    if (HAL_UART_Receive_IT(huart, &uart_rx6b_byte, 1U) != HAL_OK)
+        uart_rx6b_arm_fail_count++;
+}
+
+/* Recover RX after a UART error where HAL has ended the current reception. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART3)
+        return;
+
+    uart_rx6b_error_count++;
+    if (HAL_UART_Receive_IT(huart, &uart_rx6b_byte, 1U) != HAL_OK)
+        uart_rx6b_arm_fail_count++;
+}
+
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
